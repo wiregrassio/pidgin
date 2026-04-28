@@ -1,0 +1,21 @@
+[project]
+name = "pidgin"
+version = "0.2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "openai",
+    "anthropic",
+    "chromadb",
+    "numpy",
+    "python-dotenv",
+]
+
+[project.scripts]
+pidgin = "pidgin.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pidgin*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
