@@ -60,7 +60,7 @@ def store_path() -> Path:
     Provenance: sections_chroma.store_path (v0.1). Canonical name retained
     for backward compat; vectors.py called this nest_path().
     """
-    repo_root = Path(__file__).resolve().parent.parent.parent
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
     return repo_root / "local" / "store" / "nest"
 
 

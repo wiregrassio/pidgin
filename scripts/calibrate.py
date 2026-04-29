@@ -36,7 +36,7 @@ GEN_MODEL = "gpt-4.1-nano"
 OUTPUT_FILE = "calibration-data.json"
 
 # Load converge.xml preamble
-CONVERGE_PATH = Path(__file__).parent / "prompts" / "converge.xml"
+CONVERGE_PATH = Path(__file__).parent.parent / "src" / "pidgin" / "prompts" / "converge.xml"
 
 
 def load_converge_template():

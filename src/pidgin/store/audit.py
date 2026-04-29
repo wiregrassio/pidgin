@@ -25,8 +25,8 @@ from pathlib import Path
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-# Canonical repo root — three levels up from pidgin/store/
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+# Canonical repo root — four levels up from src/pidgin/store/
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 
 # ---------------------------------------------------------------------------
