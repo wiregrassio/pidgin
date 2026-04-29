@@ -1,0 +1,58 @@
+[
+  {
+    "probe_id": "P1_embed_for_store",
+    "function_name": "embed_for_store",
+    "description": "Await embed_text passing text, dim=STORE_EMBED_DIM, and model=STORE_EMBED_MODEL, and return the result.",
+    "function_signature": "async def embed_for_store(text: \"str | list[str]\") -> \"list[list[float]]\"",
+    "source": "m3-converge-xml/P1_embed_for_store.json (M3 converged description; gate_verdict=ambiguous, but converged=True at 15/15)",
+    "reference_implementation_path": "pidgin/utils/api.py",
+    "reference_implementation_function": "embed_for_store",
+    "reference_body": "async def embed_for_store(text: \"str | list[str]\") -> \"list[list[float]]\":\n    return await embed_text(text, dim=STORE_EMBED_DIM, model=STORE_EMBED_MODEL)",
+    "reference_body_note": "Stripped of the production docstring (expand.xml rule 5 forbids the model from generating a docstring). This is the canonical body the model should produce per the prompt rules — single return statement, no imports (description does not name asyncio per rule 8).",
+    "complexity_class": "data-flow"
+  },
+  {
+    "probe_id": "P2_main",
+    "function_name": "main",
+    "description": "Parse the command-line text argument and print the value to stdout.",
+    "function_signature": "def main()",
+    "source": "m3-converge-xml/P2_main.json (M3 converged description at target_n=12; the toy probe body in tools/mld/probe.py:MAIN_SRC is a 5-line argparse-and-print function — the M3 description matches that toy, not the production tools/embed.py:main)",
+    "reference_implementation_path": "tools/mld/probe.py",
+    "reference_implementation_function": "main (the MAIN_SRC literal at lines 27-33; this is the body M3 actually probed)",
+    "reference_body": "def main():\n    import argparse\n    parser = argparse.ArgumentParser()\n    parser.add_argument('text')\n    args = parser.parse_args()\n    print(args.text)",
+    "reference_body_note": "Augmented with `import argparse` inside the body — expand.xml rule 8 mandates local imports when the description implies a module (description says 'command-line', and the expand.xml ex_pos_localimport example shows this exact body with `import argparse` inside). The toy MAIN_SRC literal in tools/mld/probe.py is missing the import because it lives inside a triple-quoted string used as input by another harness; for this probe, the rule-compliant body is the right target.",
+    "complexity_class": "control-flow"
+  },
+  {
+    "probe_id": "P3_apply",
+    "function_name": "apply",
+    "description": "Update the state with delta, remove keys if delta value is None.",
+    "function_signature": "def apply(state, delta, strict=False)",
+    "source": "m3-converge-xml/P3_apply.json (M3 converged description at target_n=10; gate_verdict=valid, confidence=1.0)",
+    "reference_implementation_path": "tools/mld/probe.py",
+    "reference_implementation_function": "apply",
+    "complexity_class": "state-mutation"
+  },
+  {
+    "probe_id": "P4_merge",
+    "function_name": "merge",
+    "description": "Merge dictionaries a and b, prioritizing b if prefer_b is true.",
+    "function_signature": "def merge(a, b, prefer_b=True)",
+    "source": "m3-converge-xml/P4_merge.json (M3 converged description at target_n=10; gate_verdict=valid, confidence=1.0)",
+    "reference_implementation_path": "tools/mld/probe.py",
+    "reference_implementation_function": "merge",
+    "complexity_class": "numeric-geometric"
+  },
+  {
+    "probe_id": "P5_antipode_test",
+    "function_name": "antipode_test",
+    "description": "Return the count and indices of vectors in the dominant cluster. Both centroid and cosine_similarity are module-level helper functions — call them directly, do not define them and do not import any module. If vectors is empty return (0, []). Call centroid(vectors) to get c. Build sims as [cosine_similarity(v, c) for v in vectors]. If threshold == 0.0 set effective = sum(sims) / len(sims), else effective = threshold. Build kept = [i for i, s in enumerate(sims) if s >= effective]. Return (len(kept), kept).",
+    "function_signature": "def antipode_test(vectors: list[list[float]], *, threshold: float = 0.0) -> tuple[int, list[int]]",
+    "source": "Synthesized from pidgin/pipeline/geometry.py:antipode_test docstring + algorithm block (no M3 probe exists for this function; see README rationale section P5).",
+    "reference_implementation_path": "pidgin/pipeline/geometry.py",
+    "reference_implementation_function": "antipode_test",
+    "reference_body": "def antipode_test(vectors: list[list[float]], *, threshold: float = 0.0) -> tuple[int, list[int]]:\n    if not vectors:\n        return 0, []\n    c = centroid(vectors)\n    sims = [cosine_similarity(v, c) for v in vectors]\n    if threshold == 0.0:\n        effective = sum(sims) / len(sims)\n    else:\n        effective = threshold\n    kept = [i for i, s in enumerate(sims) if s >= effective]\n    return len(kept), kept",
+    "reference_body_note": "Inline override. Two fixes applied: (1) _extract_function multi-line signature truncation — source uses 4-line hanging signature, extractor stops at the un-indented closing ')'. Reference body uses the flat single-line signature matching the function_signature field. (2) Type annotations on local variables (sims: list[float], kept: list[int]) dropped — the description does not mention them, model consistently generates unannotated, AST comparison treats AnnAssign vs Assign as different. Semantically equivalent. Docstring stripped per expand.xml rule 5.",
+    "complexity_class": "complex"
+  }
+]

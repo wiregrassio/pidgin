@@ -1,0 +1,3421 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sprint Plan: tooling-v0.3
+  Authored by /new-sprint against design.md and context/ on 2026-04-27.
+  Conforms to rf-edge/marionette/mission-grammar.md.
+  Phases: 5. Missions: 19. Phase 5 conditional on Phase 4 UNLOCK (M17).
+-->
+<sprint name="tooling-v0.3" version="1">
+  <summary>
+    Fix the scaling bugs that prevented Pidgin from indexing real codebases (batch chunking,
+    error surfacing, nest at git root, dotenv, file filtering), reshape the verb surface for
+    real users (kill compress; add summarize/egg/depends; query normalization; index defaults
+    to write), add pipeline intelligence (draft stratification, import/signature tracking,
+    idempotency, adaptive stopping), and re-gate bidirectional MLD at 1000-token budget with
+    a tool-use envelope. Collect fine-tuning data as a byproduct of every index run. 19
+    missions across 5 phases. Phase 5 (M18-M19) only runs if M17 returns UNLOCK. Expected
+    duration: 1-2 sprint days. Total API spend target: under $1.00.
+  </summary>
+
+  <decision_points>
+    <dp id="1" default="4-of-5-unlock">
+      Phase 4 gate criteria (bidirectional MLD re-gate). Same as v0.2 design Decision 1:
+      4/5 stable+correct probes → UNLOCK Phase 5; 3/5 → AMBIGUOUS, commander decides
+      externally; &lt;3 → DEFER and close sprint at Phase 4.
+    </dp>
+    <dp id="2" default="defer-action-to-post-sprint">
+      Action on draft stratification result (M11 data). If draft_3 clusters tighter than
+      draft_1, the design implies switching the pipeline to weight draft_3 (or use only
+      draft_3 for centroid). If equal, switch to single-draft-per-call with more calls.
+      Default: collect data in M11; act on the finding in v0.4 — do not change pipeline
+      behavior in v0.3. Per design Decision 2.
+    </dp>
+    <dp id="3" default="defer-to-post-sprint">
+      Model routing changes (gpt-5.4-mini gate, gpt-5.1 effort=none generation). Per
+      design Decision 3: explicitly out of scope for v0.3. Decision flagged for the
+      operator to disposition before /run-sprint.
+    </dp>
+    <dp id="4" default="single-file-only">
+      Summarize (M8) chunking strategy. Per design Decision 4: implement single-file
+      MLD; implement chunking-for-context-overflow but mark experimental. Multi-file
+      and directory summarize deferred to v0.4.
+    </dp>
+    <dp id="5" default="minimal-extraction-in-M10">
+      M10 (depends verb) needs an import graph; M12 (full import + signature tracking)
+      lands later in the same sprint. Default: M10 implements a minimal AST import
+      extraction inline so the verb is functional standalone. M12 then enriches with
+      signatures, type hints, decorators, and the canonical imports.json schema; the
+      depends verb upgrades to read enriched metadata when present.
+    </dp>
+  </decision_points>
+
+  <missions>
+
+    <mission n="1" tier="execute" review="true">
+      <context><![CDATA[
+v0.2 shipped run_batch_generation and run_batch_embedding in
+/project/pidgin/pipeline/batch.py. They submit one JSONL upload per call and
+worked at sprint scale (10-300 requests per batch). First real-world stress
+test (OpenAI Python SDK, ~6500 functions) hit two hard ceilings:
+
+  - 200MB OpenAI batch input file ceiling. ~30KB converge.xml preamble × 5
+    calls × N functions saturates at ~6600 requests per file.
+  - 2,000,000 enqueued tokens per org across all active batches. With ~7.5K
+    token preamble per request, ~266 requests can be enqueued simultaneously.
+
+Both ceilings must be respected. Fix is per-call chunking: split requests
+across multiple JSONL files, submit chunks pipelined (not all at once), poll
+all active chunks concurrently, merge results by custom_id.
+
+Sync-path code in batch.py is unaffected by this mission. Only batch-path
+helpers change.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Split run_batch_generation into chunked uploads: 100 requests per JSONL
+   chunk; submit at most 2 chunks concurrently to stay under the org-wide
+   2M enqueued-token ceiling; submit the next chunk only after one of the
+   active chunks has completed.
+2. Apply the same chunked-pipelined behaviour to run_batch_embedding.
+3. Merge results from all chunks by custom_id, preserving the input order
+   of the original requests.
+4. Surface per-chunk failure independently — if any chunk fails, propagate
+   the error fields on the affected requests; do not abort sibling chunks
+   that have already completed.
+5. Ship a self-test that exercises the chunking path end-to-end.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/pipeline/batch.py`
+
+**Constants (module-level):**
+
+```python
+BATCH_CHUNK_SIZE = 100              # requests per JSONL chunk
+BATCH_MAX_CONCURRENT_CHUNKS = 2     # active chunks at once (token ceiling)
+BATCH_FILE_SIZE_CEILING = 200 * 1024 * 1024  # 200MB OpenAI ceiling, defensive check
+```
+
+**Chunking helper (new):**
+
+```python
+def _chunk_requests(
+    requests: list,                 # list of dict (OpenAI batch request lines)
+    chunk_size: int = BATCH_CHUNK_SIZE,
+) -> list[list]:
+    """Split a flat list of batch requests into chunks of <= chunk_size."""
+```
+
+**Pipelined submitter (new):**
+
+```python
+def _submit_chunks_pipelined(
+    client,                         # OpenAI client
+    chunks: list[list[dict]],
+    *,
+    endpoint: str,                  # e.g. "/v1/chat/completions" or "/v1/embeddings"
+    description: str,               # logged per chunk
+    max_concurrent: int = BATCH_MAX_CONCURRENT_CHUNKS,
+    poll_interval_s: float = 30.0,
+) -> list[dict]:
+    """Submit chunks two-at-a-time. Whenever one completes, submit the next.
+    Block until all chunks reach a terminal state. Return the merged
+    results list, preserving input order across chunks."""
+```
+
+Behaviour:
+- Pre-flight: write each chunk to its own JSONL file in a tempdir; refuse
+  to upload any chunk file > BATCH_FILE_SIZE_CEILING (defensive — chunk_size
+  100 should never approach 200MB; raise ValueError if it does).
+- Submit chunks 0 and 1 concurrently. Poll both with poll_interval_s.
+- When any chunk reaches `completed`, `failed`, `expired`, or `cancelled`,
+  download its output file and parse the JSONL into per-request results.
+- Immediately submit the next pending chunk (chunk 2, then 3, ...) — keep
+  exactly max_concurrent chunks active.
+- On chunk failure: the chunk's per-request results inherit a structured
+  error (mirror OpenAI's `error` object shape on the request line). Do not
+  raise — the caller (M2) detects and surfaces.
+- Return results merged in original input order: chunk 0's results, then
+  chunk 1's, ..., then chunk N's.
+
+**Modify run_batch_generation:**
+
+Replace the single-upload flow with: build all generation request dicts
+(unchanged logic), pass them to _chunk_requests, then to
+_submit_chunks_pipelined with `endpoint="/v1/chat/completions"` and a
+description like `"generation chunk i/N"`. Map the merged results back to
+GenerationResult objects exactly as before.
+
+**Modify run_batch_embedding:**
+
+Same shape, but `endpoint="/v1/embeddings"` and description
+`"embedding chunk i/N"`. Map results to EmbeddingResult objects.
+
+**Self-test:** add a `_self_test_chunking()` function (callable via
+`python -m pidgin.pipeline.batch --self-test-chunking`) that:
+- Generates 250 trivial generation requests (forces 3 chunks).
+- Calls run_batch_generation with dispatch='batch'.
+- Asserts len(results) == 250 and that all results came back in order
+  (custom_id N corresponds to position N in the input list).
+- Prints "PASS chunking N=250 chunks=3".
+
+**Provenance:** keep the existing comments in batch.py; add a section header
+above the new helpers: `# Chunked-pipelined batch submission (v0.3 M1)`.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/pipeline/batch.py /tmp/batch.py.m1.bak`
+   FAIL: HARD
+2. Read /project/pidgin/pipeline/batch.py using read_file. Note current
+   shapes of run_batch_generation, run_batch_embedding, GenerationResult,
+   EmbeddingResult, and how custom_ids are constructed.
+3. RUN: `wc -l /project/pidgin/pipeline/batch.py`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/pipeline/batch.py. Add the three module-level
+   constants near the top of the file, beneath the existing imports.
+   FAIL: HARD
+5. Edit /project/pidgin/pipeline/batch.py. Add the _chunk_requests and
+   _submit_chunks_pipelined helpers in a clearly demarcated section
+   (`# Chunked-pipelined batch submission (v0.3 M1)`).
+   FAIL: HARD
+6. Edit /project/pidgin/pipeline/batch.py. Replace the single-upload code
+   inside run_batch_generation with chunked-pipelined submission. Preserve
+   the existing GenerationResult mapping logic verbatim.
+   FAIL: HARD
+7. Edit /project/pidgin/pipeline/batch.py. Apply the same change to
+   run_batch_embedding for EmbeddingResult.
+   FAIL: HARD
+8. Edit /project/pidgin/pipeline/batch.py. Add the _self_test_chunking
+   function and the `if __name__ == "__main__":` argparse hook for
+   `--self-test-chunking`.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+9. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/pipeline/batch.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+10. RUN: `grep -c "BATCH_CHUNK_SIZE\|_chunk_requests\|_submit_chunks_pipelined" /project/pidgin/pipeline/batch.py`
+    EXPECT MATCHES: ^[5-9]$|^[0-9]{2}$
+    FAIL: HARD
+11. RUN: `grep -c "def run_batch_generation\|def run_batch_embedding" /project/pidgin/pipeline/batch.py`
+    EXPECT CONTAINS: 2
+    FAIL: HARD
+
+**Phase 4 — Report**
+
+12. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: /project/pidgin/pipeline/batch.py.
+- Backup path and original line count.
+- New constants and helper signatures (verbatim).
+- Diff summary for run_batch_generation and run_batch_embedding (lines
+  removed, lines added).
+- Step results table.
+- Anomalies: any deviations from the spec (especially: existing helpers
+  in batch.py with overlapping responsibilities that you did or did not
+  consolidate).
+- Rollback: `cp /tmp/batch.py.m1.bak /project/pidgin/pipeline/batch.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="2" tier="execute" review="true">
+      <context><![CDATA[
+The first real-world Pidgin stress test (OpenAI SDK, 79 functions) failed
+silently. run_batch_generation returned all 79 results with `error` fields
+populated (Cloudflare 413 on payload). The index verb (then) reported
+"Converged: 0/79" with no error message. The user had no signal that the
+pipeline never executed.
+
+This mission makes batch failures loud: when ALL results from a batch are
+errored, the index verb prints the first error message and exits 1 — never
+silently writes an empty nest. It also adds a `--verbose` flag that streams
+per-function status during index runs (useful both for batch and sync paths).
+
+This mission depends on M1's chunked submission (which now propagates
+structured error objects per request).
+      ]]></context>
+
+      <objective><![CDATA[
+1. Detect batch-wide failures in /project/pidgin/verbs/index.py and surface
+   the first error message. Exit 1 without writing the nest.
+2. Add a --verbose flag to the index verb. When set, print per-function
+   status as MLD progresses.
+3. Add a small helper to /project/pidgin/pipeline/batch.py that classifies
+   a results list as ALL_ERRORED, PARTIAL, or CLEAN (used by index.py).
+4. Preserve current behaviour when results are CLEAN or PARTIAL (PARTIAL
+   logs warnings but continues).
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/pipeline/batch.py`
+
+Add a helper:
+
+```python
+from typing import Literal
+
+BatchVerdict = Literal["CLEAN", "PARTIAL", "ALL_ERRORED"]
+
+def classify_batch_results(results: list) -> tuple[BatchVerdict, str | None]:
+    """Inspect a list of batch results (GenerationResult or EmbeddingResult).
+    Return (verdict, first_error_message_or_None).
+
+    - ALL_ERRORED: every result has a non-None error field.
+    - PARTIAL:    some have errors, some are clean.
+    - CLEAN:      no errors.
+    """
+```
+
+The error attribute name on GenerationResult/EmbeddingResult must be
+preserved verbatim (read from the existing dataclass — most likely `error`
+or similar; the executor verifies during Phase 0).
+
+**File:** `/project/pidgin/verbs/index.py`
+
+Add `--verbose` to the verb's argparse subparser (in
+/project/pidgin/cli.py if the parser lives there — read both files in
+Phase 0 and place the flag where the other index flags live).
+
+After invoking the MLD pipeline (sync or batch), call
+classify_batch_results on the returned list:
+
+```python
+verdict, first_error = classify_batch_results(results)
+if verdict == "ALL_ERRORED":
+    print(f"[index] FATAL: batch failed. First error: {first_error}",
+          file=sys.stderr)
+    return 1
+if verdict == "PARTIAL":
+    n_err = sum(1 for r in results if getattr(r, "error", None))
+    print(f"[index] WARNING: {n_err}/{len(results)} requests errored. "
+          f"Continuing with {len(results) - n_err} clean results.",
+          file=sys.stderr)
+```
+
+Index continues normally on CLEAN (writes nest) and PARTIAL (writes nest
+for the clean subset).
+
+**Verbose output:** when --verbose is set, after each function's MLD
+result is finalised, print a line:
+
+```
+[index] func=<name> file=<rel_path> status=<converged|errored|skipped> cluster=<size> drafts=<n>
+```
+
+Prefer threading the verbose flag through the verb call site rather than
+into the pipeline functions — read each result and emit the line in the
+verb's post-pipeline loop. Sync path can also emit live updates inside
+run_embedding_mld_pipeline_for_functions only if a `verbose=False`
+keyword arg is added; if that thread-through is heavier than expected,
+ship verbose-after-the-fact for v0.3 and document it.
+
+**Test (manual, documented in mission report):** simulate a failure by
+setting OPENAI_API_KEY="sk-bogus-xxx", run `pidgin index . --sync` on a
+small directory, verify exit code 1 and the first error message printed.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/verbs/index.py /tmp/index.py.m2.bak && cp /project/pidgin/pipeline/batch.py /tmp/batch.py.m2.bak && cp /project/pidgin/cli.py /tmp/cli.py.m2.bak`
+   FAIL: HARD
+2. Read /project/pidgin/pipeline/batch.py and identify the exact field
+   name used for the error on GenerationResult / EmbeddingResult.
+3. Read /project/pidgin/verbs/index.py to confirm the flag-parsing entry
+   point and where results are post-processed.
+4. Read /project/pidgin/cli.py to find where index's flags are declared.
+
+**Phase 1 — Write**
+
+5. Edit /project/pidgin/pipeline/batch.py. Add classify_batch_results.
+   FAIL: HARD
+6. Edit /project/pidgin/cli.py (or /project/pidgin/verbs/index.py if the
+   subparser lives there) to add --verbose to the index verb.
+   FAIL: HARD
+7. Edit /project/pidgin/verbs/index.py. After the pipeline call, invoke
+   classify_batch_results, exit 1 on ALL_ERRORED, warn on PARTIAL.
+   FAIL: HARD
+8. Edit /project/pidgin/verbs/index.py. After pipeline completes, if
+   --verbose is set, emit one status line per function as specified.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+9. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/pipeline/batch.py').read()); ast.parse(open('/project/pidgin/verbs/index.py').read()); ast.parse(open('/project/pidgin/cli.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+10. RUN: `grep -n "classify_batch_results\|ALL_ERRORED\|--verbose" /project/pidgin/pipeline/batch.py /project/pidgin/verbs/index.py /project/pidgin/cli.py`
+    EXPECT CONTAINS: classify_batch_results
+    FAIL: HARD
+11. RUN: `python -m pidgin --help`
+    EXPECT EXIT CODE: 0
+    FAIL: SOFT
+
+**Phase 4 — Report**
+
+12. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: list.
+- The exact error-field name on GenerationResult/EmbeddingResult.
+- Where --verbose was wired (cli.py or index.py).
+- Whether verbose status lines stream live (sync path) or batch-print
+  after the pipeline finishes — and why.
+- Step results table.
+- Anomalies.
+- Rollback: `cp /tmp/index.py.m2.bak /project/pidgin/verbs/index.py && cp /tmp/batch.py.m2.bak /project/pidgin/pipeline/batch.py && cp /tmp/cli.py.m2.bak /project/pidgin/cli.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="3" tier="execute" review="true">
+      <context><![CDATA[
+v0.2 stress test bug 3: `pidgin index ./src/openai/resources/chat --write-db`
+created the nest at `./src/openai/resources/chat/.pidgin/nest/` instead of
+the repo root. One repo must equal one nest. The fix: every verb resolves
+the nest location by walking up to .git, never from args.path.
+
+`_find_project_root(start_dir: str) -> str | None` already exists at
+/project/pidgin/write/new.py:41 — it walks up looking for .git. M3 reuses
+it; do NOT fork or rewrite it.
+
+Verbs to update: index, query, init, plus the new verbs egg (M9) and
+depends (M10). egg/depends will use the same convention by following the
+pattern this mission establishes; this mission lands the convention in
+init/index/query and the nest store helper. The exact helper used to open
+the nest store should accept a path-or-None and resolve to git root
+internally.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Move the canonical resolver into a shared module so it is callable from
+   every verb and from the nest store.
+2. Update init, index, and query to resolve nest location via git root
+   (independent of args.path or cwd).
+3. Update /project/pidgin/store/nest.py so its open/ensure helpers accept
+   an arbitrary anchor path, walk up to .git, and place the nest at
+   `<git_root>/.pidgin/nest/`. If no .git ancestor exists, fall back to
+   the original anchor with a warning.
+4. Verify subdirectory-indexed nests now live at the repo root.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Move/share the resolver:**
+
+The canonical resolver currently sits in /project/pidgin/write/new.py:41.
+Promote it (do NOT duplicate):
+
+- Move `_find_project_root` to /project/pidgin/utils/git.py and rename
+  to `find_project_root` (drop the underscore prefix — it is now public).
+- Update both /project/pidgin/write/new.py and
+  /project/pidgin/write/compress.py to import from utils.git instead of
+  the local definition.
+- Add a thin module-level alias in pidgin/write/new.py:
+  `_find_project_root = find_project_root` so any other internal callers
+  do not break (remove the alias in M19 cleanup).
+
+**Update the nest store:**
+
+In /project/pidgin/store/nest.py, find every helper that takes a path
+(open_nest, ensure_nest, etc.) and inject git-root resolution:
+
+```python
+from pidgin.utils.git import find_project_root
+
+def _resolve_nest_dir(anchor: str | None) -> str:
+    """Resolve the canonical .pidgin/nest/ location for an anchor path.
+    Walks up to .git. If no .git is found, falls back to anchor with a
+    warning printed to stderr.
+    """
+    anchor = anchor or os.getcwd()
+    root = find_project_root(anchor)
+    if root is None:
+        print(f"[nest] WARNING: no .git found above {anchor}; "
+              f"using {anchor} as nest anchor.", file=sys.stderr)
+        root = anchor
+    return os.path.join(root, ".pidgin", "nest")
+```
+
+Every existing callsite that constructs a `.pidgin/nest/` path inside
+nest.py must go through `_resolve_nest_dir`. Do not change the public
+function signatures of nest.py — only redirect internal path resolution.
+
+**Update verbs:**
+
+- /project/pidgin/verbs/init.py: pass the user-supplied path (or cwd) to
+  ensure_nest; ensure_nest now resolves to git root internally.
+- /project/pidgin/verbs/index.py: same — never derive `.pidgin/nest/`
+  manually from args.path.
+- /project/pidgin/verbs/query.py: same — query resolves the nest from
+  cwd via git root.
+
+**Test:**
+
+Add a small CLI-level smoke test, runnable manually:
+
+```bash
+mkdir -p /tmp/pidgin-m3-test/sub/deep && cd /tmp/pidgin-m3-test && git init -q
+python -m pidgin init ./sub/deep
+test -d /tmp/pidgin-m3-test/.pidgin/nest && echo PASS_GIT_ROOT || echo FAIL
+test ! -d /tmp/pidgin-m3-test/sub/deep/.pidgin/nest && echo PASS_NO_DEEP || echo FAIL
+```
+
+The mission's verification step runs this smoke test inline.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/write/new.py /tmp/new.py.m3.bak && cp /project/pidgin/write/compress.py /tmp/compress.py.m3.bak && cp /project/pidgin/store/nest.py /tmp/nest.py.m3.bak && cp /project/pidgin/verbs/init.py /tmp/init.py.m3.bak && cp /project/pidgin/verbs/index.py /tmp/index.py.m3.bak && cp /project/pidgin/verbs/query.py /tmp/query.py.m3.bak && cp /project/pidgin/utils/git.py /tmp/git.py.m3.bak`
+   FAIL: HARD
+2. Read /project/pidgin/write/new.py lines 30-90 to capture the current
+   _find_project_root body verbatim.
+3. Read /project/pidgin/utils/git.py to see existing surface.
+4. Read /project/pidgin/store/nest.py to enumerate all callsites that
+   construct `.pidgin/nest/` paths.
+
+**Phase 1 — Write**
+
+5. Edit /project/pidgin/utils/git.py — add a public `find_project_root`
+   (verbatim body of _find_project_root from new.py).
+   FAIL: HARD
+6. Edit /project/pidgin/write/new.py — replace the local definition with
+   `from pidgin.utils.git import find_project_root` plus the alias
+   `_find_project_root = find_project_root`. Update internal references.
+   FAIL: HARD
+7. Edit /project/pidgin/write/compress.py — replace its
+   `from pidgin.write.new import _find_project_root` (or equivalent)
+   import with `from pidgin.utils.git import find_project_root` and use
+   the public name.
+   FAIL: HARD
+8. Edit /project/pidgin/store/nest.py — add `_resolve_nest_dir` helper
+   and route every internal `.pidgin/nest/` path through it.
+   FAIL: HARD
+9. Edit /project/pidgin/verbs/index.py — drop any args.path-derived nest
+   path; pass the path/cwd through to ensure_nest unchanged.
+   FAIL: HARD
+10. Edit /project/pidgin/verbs/init.py — same.
+    FAIL: HARD
+11. Edit /project/pidgin/verbs/query.py — same.
+    FAIL: HARD
+
+**Phase 2 — Verify**
+
+12. RUN: `python -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/project/pidgin/**/*.py', recursive=True)]"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+13. RUN: `grep -rn "find_project_root\|_resolve_nest_dir" /project/pidgin/utils/git.py /project/pidgin/store/nest.py /project/pidgin/verbs/ /project/pidgin/write/`
+    EXPECT CONTAINS: find_project_root
+    FAIL: HARD
+14. RUN: `bash -c 'rm -rf /tmp/pidgin-m3-test && mkdir -p /tmp/pidgin-m3-test/sub/deep && cd /tmp/pidgin-m3-test && git init -q && python -m pidgin init ./sub/deep && test -d /tmp/pidgin-m3-test/.pidgin/nest && echo PASS_GIT_ROOT && test ! -d /tmp/pidgin-m3-test/sub/deep/.pidgin/nest && echo PASS_NO_DEEP'`
+    EXPECT CONTAINS: PASS_GIT_ROOT
+    FAIL: HARD
+15. RUN: `bash -c 'cd /tmp/pidgin-m3-test && python -m pidgin init ./sub/deep && test ! -d /tmp/pidgin-m3-test/sub/deep/.pidgin/nest && echo PASS_NO_DEEP'`
+    EXPECT CONTAINS: PASS_NO_DEEP
+    FAIL: HARD
+
+**Phase 4 — Report**
+
+16. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: list.
+- Whether the alias `_find_project_root = find_project_root` was retained
+  in pidgin/write/new.py (yes/no, and where else internal callers live).
+- Step results table including the smoke-test transcript.
+- Anomalies: any callsite that constructed `.pidgin/nest/` outside
+  nest.py and how it was resolved.
+- Rollback: 7-file `cp /tmp/...m3.bak` sequence (write it out).
+      ]]></report>
+    </mission>
+
+    <mission n="4" tier="execute" review="false">
+      <context><![CDATA[
+v0.2 hardcoded `load_dotenv('/Users/elliotwillis/Desktop/fe-toolkit/local/.env',
+override=True)` in two places:
+
+  - /project/pidgin/pipeline/batch.py:24
+  - /project/pidgin/utils/api.py:10
+
+The path is the original developer's laptop. Pidgin must work as a general
+tool from any cwd — env vars first, .env discovery second, clear error
+third.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Replace hardcoded dotenv paths in batch.py and utils/api.py with a
+   shared resolver that prefers OS environment, then load_dotenv() (no
+   path), then errors.
+2. The resolver should be defined once in pidgin/utils/api.py and imported
+   from batch.py.
+3. Print a clear error and exit 1 when neither OPENAI_API_KEY nor
+   ANTHROPIC_API_KEY (whichever is needed for the call) can be resolved.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/utils/api.py`
+
+Add a shared resolver near the top of the file (after imports, before any
+client construction):
+
+```python
+from dotenv import load_dotenv  # already imported
+
+_DOTENV_LOADED = False
+
+def ensure_api_key(name: str) -> str:
+    """Resolve an API key. Order:
+       1. os.environ[name].
+       2. load_dotenv() (no path; finds .env in cwd or parents) once
+          per process, then os.environ[name].
+       3. Print an error and sys.exit(1).
+    """
+    global _DOTENV_LOADED
+    val = os.environ.get(name)
+    if val:
+        return val
+    if not _DOTENV_LOADED:
+        load_dotenv()  # walks up from cwd
+        _DOTENV_LOADED = True
+        val = os.environ.get(name)
+        if val:
+            return val
+    print(f"[pidgin] FATAL: {name} not set. Export it in your shell or "
+          f"place a .env file in this directory or any parent.",
+          file=sys.stderr)
+    sys.exit(1)
+```
+
+Replace the existing `load_dotenv('/Users/...')` line. Where the OpenAI
+client is constructed, call `ensure_api_key("OPENAI_API_KEY")` to obtain
+the value (or rely on the implicit env-var pickup after dotenv has run —
+the executor decides which is cleaner given the surrounding code, and
+documents the choice).
+
+**File:** `/project/pidgin/pipeline/batch.py`
+
+Remove the line `load_dotenv('/Users/elliotwillis/Desktop/fe-toolkit/local/.env',
+override=True)` and the `from dotenv import load_dotenv` import. Replace
+with `from pidgin.utils.api import ensure_api_key` and call
+`ensure_api_key("OPENAI_API_KEY")` (and ANTHROPIC_API_KEY where Anthropic
+batch dispatch lives) before constructing any client.
+
+**Test:**
+
+```bash
+cd /tmp && mkdir -p pidgin-m4-test && cd pidgin-m4-test
+# Test 1: env var only.
+OPENAI_API_KEY=sk-test-only python -c "from pidgin.utils.api import ensure_api_key; print(ensure_api_key('OPENAI_API_KEY'))"
+# expected: sk-test-only
+# Test 2: missing key (capture exit code).
+unset OPENAI_API_KEY; python -c "from pidgin.utils.api import ensure_api_key; ensure_api_key('OPENAI_API_KEY')" || echo "EXIT_$?"
+# expected: prints FATAL and EXIT_1
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/utils/api.py /tmp/api.py.m4.bak && cp /project/pidgin/pipeline/batch.py /tmp/batch.py.m4.bak`
+   FAIL: HARD
+2. Read /project/pidgin/utils/api.py to see existing import block and
+   client construction.
+3. RUN: `grep -n "load_dotenv\|/Users/elliotwillis" /project/pidgin/utils/api.py /project/pidgin/pipeline/batch.py`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/utils/api.py — add ensure_api_key, remove the
+   hardcoded load_dotenv line.
+   FAIL: HARD
+5. Edit /project/pidgin/pipeline/batch.py — remove the hardcoded
+   load_dotenv line and the `from dotenv import load_dotenv` import,
+   add `from pidgin.utils.api import ensure_api_key`, call ensure for
+   each provider before client construction.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+6. RUN: `grep -c "/Users/elliotwillis" /project/pidgin/utils/api.py /project/pidgin/pipeline/batch.py`
+   EXPECT CONTAINS: 0
+   FAIL: HARD
+7. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/utils/api.py').read()); ast.parse(open('/project/pidgin/pipeline/batch.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+8. RUN: `bash -c 'OPENAI_API_KEY=sk-stub python -c "from pidgin.utils.api import ensure_api_key; print(ensure_api_key(chr(34)+chr(34)+chr(34)+\"OPENAI_API_KEY\"+chr(34)+chr(34)+chr(34)))" 2>/dev/null || OPENAI_API_KEY=sk-stub python -c "from pidgin.utils.api import ensure_api_key; print(ensure_api_key(\"OPENAI_API_KEY\"))"'`
+   EXPECT CONTAINS: sk-stub
+   FAIL: HARD
+9. RUN: `bash -c 'unset OPENAI_API_KEY; cd /tmp && python -c "from pidgin.utils.api import ensure_api_key; ensure_api_key(\"OPENAI_API_KEY\")"; echo EXIT_$?'`
+   EXPECT CONTAINS: EXIT_1
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- Where each ensure_api_key call was placed (line numbers).
+- Step results table.
+- Rollback: `cp /tmp/api.py.m4.bak /project/pidgin/utils/api.py && cp /tmp/batch.py.m4.bak /project/pidgin/pipeline/batch.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="5" tier="execute" review="true">
+      <context><![CDATA[
+The OpenAI SDK has 6500 functions, most auto-generated Pydantic stubs.
+Real client code is ~200-300 functions. Indexing must skip noise: select
+files by extension, skip vendor and venv directories, never descend into
+child .git boundaries, accept user --exclude globs, and report a file-type
+breakdown in dry-run output.
+
+Current parser at /project/pidgin/utils/parser.py walks the tree and
+extracts public functions (Python ast). M5 adds the filter layer
+upstream of parser invocation.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Add a SUPPORTED_EXTENSIONS allowlist (.py for now; future-proof for
+   .rs/.ts/.go).
+2. Add a SKIP_DIRS denylist: .pidgin, .git, __pycache__, node_modules,
+   .venv, venv, .tox, build, dist, .mypy_cache, .pytest_cache.
+3. Stop traversal at child .git directories — do not descend into
+   submodules or vendored repos.
+4. Add an --exclude flag to the index verb, accepting one or more glob
+   patterns. Patterns are matched against paths relative to the indexed
+   root.
+5. Emit a per-extension file-type breakdown in --dry-run output (M6
+   ships --dry-run; this mission emits the breakdown via a helper that
+   M6 will call).
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/utils/parser.py`
+
+Add module-level constants:
+
+```python
+SUPPORTED_EXTENSIONS = {".py"}    # v0.3; v0.4 may add .rs/.ts/.go
+SKIP_DIRS = {
+    ".pidgin", ".git", "__pycache__", "node_modules",
+    ".venv", "venv", ".tox", "build", "dist",
+    ".mypy_cache", ".pytest_cache",
+}
+```
+
+Add a generator:
+
+```python
+import fnmatch
+from pathlib import Path
+
+def walk_source_files(
+    root: str,
+    *,
+    exclude_globs: list[str] | None = None,
+) -> "Iterator[Path]":
+    """Yield Path objects for every file under root that:
+      - has an extension in SUPPORTED_EXTENSIONS,
+      - is not inside a directory whose basename is in SKIP_DIRS,
+      - is not under a child .git boundary (any directory containing
+        .git that is NOT root itself),
+      - does not match any of the exclude_globs (glob matched against
+        the path relative to root).
+    """
+    root_p = Path(root).resolve()
+    exclude_globs = exclude_globs or []
+    for dirpath, dirnames, filenames in os.walk(root_p):
+        dp = Path(dirpath).resolve()
+        # Prune skip-dir children.
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIRS
+            and not (
+                dp != root_p and (Path(dirpath, d) / ".git").exists()
+            )
+        ]
+        # Detect child-git at the dirpath itself.
+        if dp != root_p and (dp / ".git").exists():
+            dirnames[:] = []
+            continue
+        for fn in filenames:
+            p = Path(dirpath, fn)
+            if p.suffix not in SUPPORTED_EXTENSIONS:
+                continue
+            rel = str(p.relative_to(root_p))
+            if any(fnmatch.fnmatch(rel, g) for g in exclude_globs):
+                continue
+            yield p
+```
+
+Add a breakdown helper:
+
+```python
+def file_type_breakdown(
+    root: str,
+    *,
+    exclude_globs: list[str] | None = None,
+) -> dict[str, int]:
+    """Return {extension: count} for files that pass the filter, plus
+    {'__skipped_dirs': N} as a sentinel summary."""
+```
+
+**File:** `/project/pidgin/verbs/index.py`
+
+Replace the current file walk (whatever it is — likely a glob or os.walk
+inline) with `walk_source_files(args.path, exclude_globs=args.exclude)`.
+
+Add `--exclude` to the index argparse subparser:
+
+```python
+parser.add_argument(
+    "--exclude", action="append", default=[],
+    metavar="GLOB",
+    help="Glob pattern to exclude (relative to indexed root). May be "
+         "passed multiple times.",
+)
+```
+
+**Smoke test (manual, executed in verify phase):**
+
+```bash
+mkdir -p /tmp/pidgin-m5-test/{a,b,vendor,sub_repo}
+cd /tmp/pidgin-m5-test && git init -q
+echo 'def f(): pass' > a/x.py
+echo 'def g(): pass' > b/y.py
+mkdir -p sub_repo/.git
+echo 'def h(): pass' > sub_repo/z.py
+echo '{"key":1}' > a/data.json
+python -c "from pidgin.utils.parser import walk_source_files; print(sorted(str(p) for p in walk_source_files('/tmp/pidgin-m5-test')))"
+# expected: only a/x.py and b/y.py — sub_repo/z.py excluded by child-.git, data.json excluded by extension
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/utils/parser.py /tmp/parser.py.m5.bak && cp /project/pidgin/verbs/index.py /tmp/index.py.m5.bak`
+   FAIL: HARD
+2. Read /project/pidgin/utils/parser.py.
+3. Read /project/pidgin/verbs/index.py to find the current file-walk
+   call site.
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/utils/parser.py. Add SUPPORTED_EXTENSIONS,
+   SKIP_DIRS, walk_source_files, and file_type_breakdown.
+   FAIL: HARD
+5. Edit /project/pidgin/verbs/index.py. Replace the file-walk with
+   walk_source_files; add --exclude.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+6. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/utils/parser.py').read()); ast.parse(open('/project/pidgin/verbs/index.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+7. RUN: `bash -c 'rm -rf /tmp/pidgin-m5-test && mkdir -p /tmp/pidgin-m5-test/{a,b,vendor,sub_repo} && cd /tmp/pidgin-m5-test && git init -q && echo "def f(): pass" > a/x.py && echo "def g(): pass" > b/y.py && mkdir -p sub_repo/.git && echo "def h(): pass" > sub_repo/z.py && echo "data" > a/data.json && python -c "from pidgin.utils.parser import walk_source_files; ps=sorted(str(p) for p in walk_source_files(\"/tmp/pidgin-m5-test\")); print(\"\\n\".join(ps))"'`
+   EXPECT CONTAINS: a/x.py
+   EXPECT NOT CONTAINS: sub_repo/z.py
+   FAIL: HARD
+8. RUN: `bash -c 'cd /tmp/pidgin-m5-test && python -c "from pidgin.utils.parser import walk_source_files; ps=sorted(str(p) for p in walk_source_files(\"/tmp/pidgin-m5-test\", exclude_globs=[\"a/*\"])); print(\"\\n\".join(ps))"'`
+   EXPECT NOT CONTAINS: x.py
+   EXPECT CONTAINS: y.py
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+9. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- Smoke-test transcript (Phase 2 step 7 and step 8 stdout).
+- Step results table.
+- Anomalies (especially: existing file-walking helpers that overlap and
+  whether you removed them).
+- Rollback: `cp /tmp/parser.py.m5.bak /project/pidgin/utils/parser.py && cp /tmp/index.py.m5.bak /project/pidgin/verbs/index.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="6" tier="execute" review="true">
+      <context><![CDATA[
+v0.2 verb redesign decision: kill compress (no user story; file-level
+summaries are a byproduct of index), make index default to write (was
+dry-run gated by PD6), and add a real --dry-run that shows function
+count, estimated API calls, estimated cost, and API-key status.
+
+File-level summaries: the design says these should be a byproduct of
+index — synthesised from the per-function descriptions of all functions
+in a file. Implement as a post-processing step inside index after MLD
+completes. Store the file summary alongside the file's metadata in the
+nest.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Delete /project/pidgin/verbs/compress.py and remove the compress verb
+   wiring from /project/pidgin/cli.py.
+2. Remove the compress re-export from /project/pidgin/verbs/__init__.py
+   if present.
+3. Change index default behaviour to WRITE (not dry-run). Remove the
+   PD6 gate.
+4. Add --dry-run flag to index. When set: walk files, count public
+   functions, estimate API calls, estimate cost, check API-key
+   availability, print summary, do not call any APIs, do not write nest.
+5. Add a post-MLD step inside index that synthesises a one-paragraph
+   file-level summary from the per-function descriptions and stores it
+   in the nest.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Delete:**
+- /project/pidgin/verbs/compress.py.
+
+**Remove imports:**
+- /project/pidgin/cli.py: drop the compress subparser registration.
+- /project/pidgin/verbs/__init__.py: drop any compress re-export.
+
+If any other module imports compress, raise an Anomaly in the report.
+Do NOT silently leave stub imports.
+
+**Index defaults:**
+
+In /project/pidgin/verbs/index.py:
+- Remove the PD6 dry-run-as-default gate. Default behaviour: walk files,
+  call MLD, write nest.
+- `--dry-run` (boolean flag): if set, run the dry-run preview and exit 0.
+
+**Dry-run preview:**
+
+```python
+def _print_dry_run_summary(
+    root: str,
+    exclude_globs: list[str],
+) -> None:
+    """Print a markdown-flavoured summary to stdout:
+
+    [index --dry-run] root=<abs path>
+    --
+    Files (by extension):
+      .py: <N>
+    Public functions: <M>
+    Estimated API calls: <M> functions × ~5 calls each = <K>
+    Estimated cost: ~$<C> (gpt-4.1-nano + text-embedding-3-small)
+    API keys:
+      OPENAI_API_KEY:    [present|MISSING]
+      ANTHROPIC_API_KEY: [present|MISSING]
+    --
+    Run without --dry-run to execute.
+    """
+```
+
+Cost coefficient: use a single conservative constant
+`COST_PER_FUNCTION_USD = 0.0002` (~$0.20 per 1000 functions; v0.2 sprint
+spent ~$0.10 across 16 missions). Document the constant inline.
+
+**File-level summaries (byproduct):**
+
+After MLD completes, group results by file. For each file:
+
+```python
+descriptions = [r.mld_description for r in fn_results_in_file]
+combined = "\n".join(f"- {d}" for d in descriptions)
+prompt = f"""Summarise the file's role in one paragraph (3-4 sentences).
+The file's public functions are described as:
+
+{combined}
+
+Output: a single paragraph. No header, no bullets."""
+file_summary = openai_complete(model="gpt-4.1-nano", prompt=prompt)
+```
+
+Store the file_summary in the nest as part of the file's metadata
+(extend the existing FunctionRecord storage with a sibling
+FileRecord, or attach to the first function in the file — whichever
+shape the existing nest schema admits with the smallest delta. The
+executor reads /project/pidgin/store/nest.py in Phase 0 and chooses;
+documents the choice in the report).
+
+**Test:**
+
+```
+pidgin index . --dry-run
+```
+Expected: prints the summary, exits 0, no API calls.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/cli.py /tmp/cli.py.m6.bak && cp /project/pidgin/verbs/index.py /tmp/index.py.m6.bak && cp /project/pidgin/verbs/compress.py /tmp/compress.py.m6.bak && cp /project/pidgin/verbs/__init__.py /tmp/verbs__init__.py.m6.bak`
+   FAIL: HARD
+2. RUN: `grep -rn "compress" /project/pidgin/ --include='*.py'`
+   FAIL: SOFT
+3. Read /project/pidgin/store/nest.py to determine where to store the
+   file-level summary.
+
+**Phase 1 — Write**
+
+4. RUN: `rm /project/pidgin/verbs/compress.py`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+5. Edit /project/pidgin/cli.py — drop the compress subparser
+   registration block.
+   FAIL: HARD
+6. Edit /project/pidgin/verbs/__init__.py — drop any compress export.
+   FAIL: HARD
+7. Edit /project/pidgin/verbs/index.py — remove PD6 dry-run gate; add
+   --dry-run flag, _print_dry_run_summary, and the post-MLD file-summary
+   synthesis loop.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+8. RUN: `test ! -f /project/pidgin/verbs/compress.py && echo COMPRESS_DELETED`
+   EXPECT CONTAINS: COMPRESS_DELETED
+   FAIL: HARD
+9. RUN: `grep -rn "from pidgin.verbs.compress\|import compress" /project/pidgin/ --include='*.py'`
+   EXPECT EXIT CODE: 1
+   FAIL: HARD
+10. RUN: `python -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/project/pidgin/**/*.py', recursive=True)]"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+11. RUN: `python -m pidgin --help`
+    EXPECT NOT CONTAINS: compress
+    FAIL: SOFT
+12. RUN: `bash -c 'cd /tmp && rm -rf m6-test && mkdir m6-test && cd m6-test && git init -q && echo "def f(): pass" > x.py && python -m pidgin index . --dry-run'`
+    EXPECT CONTAINS: dry-run
+    FAIL: HARD
+
+**Phase 4 — Report**
+
+13. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified, files deleted.
+- Where the file-level summary is stored (which dataclass / which
+  collection) and rationale.
+- Step results table (include dry-run output).
+- Anomalies: any unexpected references to compress.
+- Rollback: restore from .bak files.
+      ]]></report>
+    </mission>
+
+    <mission n="7" tier="execute" review="false">
+      <context><![CDATA[
+Stored MLD descriptions are imperative: "Parse CSV file and return rows
+as dictionaries." Human queries are interrogative: "How do I parse a
+CSV?" These are geometrically distant in embedding space. Fix: pre-process
+human queries through gpt-4.1-nano with a normalisation prompt before
+embedding. --raw flag skips normalisation for LLM callers whose queries
+are already imperative.
+
+One nano call per query. ~100ms latency. Negligible cost. Touches one
+verb only.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Add a `_normalise_query(text: str) -> str` helper to query.py.
+2. Call it before embedding the query.
+3. Add `--raw` to the query subparser; when set, skip normalisation.
+4. Print the normalised form when --verbose is set so users can see what
+   was actually embedded.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/verbs/query.py`
+
+```python
+NORMALISE_PROMPT = """Rewrite the user's query as a single imperative
+function description in present tense, matching the style of a docstring
+summary. One sentence, ending with a period. No leading verbs like
+"function that" or "returns". Just the imperative.
+
+Examples:
+  "how do I parse a CSV?" -> "Parse a CSV file and return rows as dictionaries."
+  "what reads the config" -> "Read the configuration file and return its contents."
+
+Query: {query}
+Output: only the rewritten sentence, no preamble."""
+
+def _normalise_query(text: str) -> str:
+    """Pass the query through gpt-4.1-nano. Return the rewritten text.
+    Fallback to the original text on API failure (no exception)."""
+    from pidgin.utils.api import ensure_api_key, openai_client  # whichever shape exists
+    ensure_api_key("OPENAI_API_KEY")
+    try:
+        client = openai_client()
+        resp = client.chat.completions.create(
+            model="gpt-4.1-nano",
+            messages=[{"role": "user", "content": NORMALISE_PROMPT.format(query=text)}],
+            max_tokens=80,
+            temperature=0.0,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[query] WARNING: normalisation failed ({e}); using raw query.",
+              file=sys.stderr)
+        return text
+```
+
+Wire it in:
+
+```python
+def run_query(args):
+    text = args.query
+    if not args.raw:
+        normalised = _normalise_query(text)
+        if args.verbose:
+            print(f"[query] raw=      {text}", file=sys.stderr)
+            print(f"[query] normalised={normalised}", file=sys.stderr)
+        text = normalised
+    # ... existing embedding + ANN search path uses `text` ...
+```
+
+Argparse:
+
+```python
+parser.add_argument("--raw", action="store_true",
+    help="Skip query normalisation (use the input text verbatim).")
+parser.add_argument("--verbose", action="store_true",
+    help="Print the normalised query before embedding.")
+```
+
+If `openai_client` does not already exist in pidgin/utils/api.py, expose
+the existing client construction as a small accessor. Do not duplicate
+client setup in query.py.
+
+**Test:**
+
+Manual smoke (no real API call required for AST/import check):
+
+```python
+python -c "from pidgin.verbs.query import _normalise_query; print('IMPORT_OK')"
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/verbs/query.py /tmp/query.py.m7.bak && cp /project/pidgin/utils/api.py /tmp/api.py.m7.bak`
+   FAIL: HARD
+2. Read /project/pidgin/verbs/query.py.
+3. Read /project/pidgin/utils/api.py to confirm whether an
+   `openai_client()` accessor already exists; if not, plan to add one.
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/utils/api.py — add `openai_client()` accessor
+   if absent (returns a singleton OpenAI client; cached at module level).
+   FAIL: HARD
+5. Edit /project/pidgin/verbs/query.py — add NORMALISE_PROMPT,
+   _normalise_query, --raw, --verbose, wire into run_query.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+6. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/verbs/query.py').read()); ast.parse(open('/project/pidgin/utils/api.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+7. RUN: `python -c "from pidgin.verbs.query import _normalise_query; print('IMPORT_OK')"`
+   EXPECT CONTAINS: IMPORT_OK
+   FAIL: HARD
+8. RUN: `python -m pidgin query --help`
+   EXPECT CONTAINS: --raw
+   FAIL: SOFT
+
+**Phase 4 — Report**
+
+9. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- Whether openai_client() existed already or was added.
+- Step results table.
+- Rollback: restore from .bak files.
+      ]]></report>
+    </mission>
+
+    <mission n="8" tier="execute" review="true">
+      <context><![CDATA[
+New verb: summarize. Single-file MLD to stdout. No nest, no embedding.
+Pipe-friendly. Markdown by default; --xml flag emits structured XML.
+
+Two cases:
+  - File fits in context (a heuristic — say <80% of model context
+    window): single MLD pass.
+  - File exceeds context: chunk by AST top-level units (functions,
+    classes), summarise each chunk, then summarise the summaries
+    (experimental — DP4 default).
+
+Reuses the converge.xml prompt pipeline already at
+/project/pidgin/prompts/converge.xml, but without writing to the nest.
+
+Use case: ingest external docs/SDK guides via stdin or file, pipe into
+n8n / Slack workflows.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Create /project/pidgin/verbs/summarize.py.
+2. Wire `summarize` into /project/pidgin/cli.py with positional path
+   argument (or stdin if "-"), --xml flag, --markdown flag (default).
+3. Implement the single-pass case: read file, build a one-shot summary
+   prompt (re-using converge.xml's preamble where it fits), call
+   gpt-4.1-nano, emit markdown or XML.
+4. Implement the chunked case (mark experimental, document in code
+   comments referencing DP4): split by AST top-level units, summarise
+   each, then summarise the summaries. Cap recursion at one level.
+5. Output goes to stdout; never touches the nest.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/verbs/summarize.py`
+
+```python
+"""pidgin summarize <path|->: emit a single-file MLD summary to stdout.
+
+DP4 (v0.3): chunked-summary path is experimental. Multi-file and
+directory summarize are deferred to v0.4.
+"""
+
+import sys
+import ast
+from pathlib import Path
+
+CONTEXT_BUDGET_TOKENS = 80_000   # safe single-pass cutoff for gpt-4.1-nano
+
+PROMPT_HEADER_MD = """You are summarising a source file for a developer.
+Output: a markdown document with these sections:
+
+# <filename>
+## Role
+<one-paragraph: what the file does and why it exists>
+## Public Surface
+<bulleted list of public functions/classes with one-sentence descriptions>
+## Notes
+<anything notable: unusual patterns, dependencies, side effects>
+
+Do not include code blocks. Do not invent. Source follows.
+"""
+
+PROMPT_HEADER_XML = """Output XML matching this shape:
+
+<file path="...">
+  <role>...</role>
+  <surface>
+    <symbol kind="function|class" name="..."><desc>...</desc></symbol>
+  </surface>
+  <notes>...</notes>
+</file>
+
+Do not include the file's source verbatim in your response. Source follows.
+"""
+
+def _read_input(path: str) -> tuple[str, str]:
+    """Return (display_name, contents). path == '-' reads stdin."""
+    if path == "-":
+        return ("<stdin>", sys.stdin.read())
+    p = Path(path)
+    return (p.name, p.read_text())
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)  # rough; tiktoken not required
+
+def _summarise_single(name: str, text: str, *, mode: str) -> str:
+    from pidgin.utils.api import ensure_api_key, openai_client
+    ensure_api_key("OPENAI_API_KEY")
+    header = PROMPT_HEADER_XML if mode == "xml" else PROMPT_HEADER_MD
+    prompt = f"{header}\n--- {name} ---\n{text}\n"
+    client = openai_client()
+    resp = client.chat.completions.create(
+        model="gpt-4.1-nano",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1500,
+        temperature=0.0,
+    )
+    return resp.choices[0].message.content
+
+def _split_by_ast(name: str, text: str) -> list[tuple[str, str]]:
+    """Return [(chunk_label, chunk_text)] for top-level AST units in a
+    Python file. For non-Python or parse-failure, fall back to
+    fixed-size character chunks."""
+    if not name.endswith(".py"):
+        return _fixed_chunks(name, text)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return _fixed_chunks(name, text)
+    lines = text.splitlines(keepends=True)
+    out = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = node.lineno - 1
+            end = node.end_lineno
+            label = f"{node.__class__.__name__}:{node.name}"
+            out.append((label, "".join(lines[start:end])))
+    if not out:
+        return [(name, text)]
+    return out
+
+def _fixed_chunks(name: str, text: str, *, size: int = 60_000) -> list[tuple[str, str]]:
+    out = []
+    for i, j in enumerate(range(0, len(text), size)):
+        out.append((f"{name}:chunk{i}", text[j:j+size]))
+    return out
+
+def _summarise_chunked(name: str, text: str, *, mode: str) -> str:
+    """Experimental (DP4). Summarise each chunk, then summarise the
+    chunk summaries."""
+    parts = _split_by_ast(name, text)
+    chunk_summaries: list[str] = []
+    for label, chunk_text in parts:
+        chunk_summaries.append(_summarise_single(label, chunk_text, mode="markdown"))
+    combined = "\n\n".join(f"### {p[0]}\n{s}" for p, s in zip(parts, chunk_summaries))
+    return _summarise_single(name + " (combined)", combined, mode=mode)
+
+def run_summarize(args) -> int:
+    name, text = _read_input(args.path)
+    mode = "xml" if args.xml else "markdown"
+    if _estimate_tokens(text) <= CONTEXT_BUDGET_TOKENS:
+        out = _summarise_single(name, text, mode=mode)
+    else:
+        out = _summarise_chunked(name, text, mode=mode)
+    sys.stdout.write(out)
+    if not out.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+```
+
+**Wire into cli.py:**
+
+```python
+sp_summarize = subparsers.add_parser(
+    "summarize", help="Single-file MLD to stdout (markdown or XML).")
+sp_summarize.add_argument("path", help="Path to source file or '-' for stdin.")
+group = sp_summarize.add_mutually_exclusive_group()
+group.add_argument("--markdown", action="store_true", help="Markdown output (default).")
+group.add_argument("--xml", action="store_true", help="XML output.")
+sp_summarize.set_defaults(func=run_summarize_main_entry)
+```
+
+`run_summarize_main_entry` imports lazily from
+pidgin.verbs.summarize and returns the exit code.
+
+**Test:**
+
+```bash
+echo 'def hello(name): return f"Hi, {name}"' | python -m pidgin summarize -
+# expected: markdown summary mentioning hello, returns 0
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/cli.py /tmp/cli.py.m8.bak && test -f /project/pidgin/verbs/summarize.py && cp /project/pidgin/verbs/summarize.py /tmp/summarize.py.m8.bak || echo NO_PRIOR_FILE`
+   FAIL: HARD
+2. Read /project/pidgin/cli.py to find where subparsers are added.
+
+**Phase 1 — Write**
+
+3. Write /project/pidgin/verbs/summarize.py per the specification.
+   FAIL: HARD
+4. Edit /project/pidgin/cli.py to register the summarize subparser.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+5. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/verbs/summarize.py').read()); ast.parse(open('/project/pidgin/cli.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+6. RUN: `python -c "from pidgin.verbs.summarize import _split_by_ast, _summarise_single; print('IMPORT_OK')"`
+   EXPECT CONTAINS: IMPORT_OK
+   FAIL: HARD
+7. RUN: `python -m pidgin summarize --help`
+   EXPECT CONTAINS: --xml
+   FAIL: SOFT
+
+**Phase 4 — Report**
+
+8. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files written, files modified.
+- The full subparser block added to cli.py (verbatim).
+- Step results table.
+- Anomalies (e.g. existing summarize verb, conflicts with verbs/__init__).
+- Rollback: `rm /project/pidgin/verbs/summarize.py && cp /tmp/cli.py.m8.bak /project/pidgin/cli.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="9" tier="execute" review="true">
+      <context><![CDATA[
+New verb: egg. `pidgin egg <path>` walks an indexed repo and
+generates/updates CLAUDE.md discovery files in every directory that
+contains indexed functions. Each CLAUDE.md is a tier-1 index for that
+directory, readable by any model without Pidgin installed.
+
+Reads from the nest (must be populated — error if empty). Writes to the
+filesystem.
+
+Each CLAUDE.md lists, for the directory:
+  - File names and one-line file summaries (from M6's file-level
+    summaries).
+  - Per file, a table of public functions with name + MLD description.
+  - Exported symbols (when M12 ships, include imports/exports too; for
+    M9, function names are sufficient).
+
+Idempotent: re-running egg overwrites existing CLAUDE.md files written
+by egg, but preserves user-edited content above a sentinel. Sentinel
+convention:
+
+```
+<!-- egg:auto-generated below this line. Do not edit by hand. -->
+```
+
+User content above the sentinel survives; egg replaces everything below.
+If no sentinel exists in the file, egg PREPENDS a new auto-generated
+section (does not destroy user content).
+      ]]></context>
+
+      <objective><![CDATA[
+1. Create /project/pidgin/verbs/egg.py.
+2. Wire `egg` into /project/pidgin/cli.py with positional path argument.
+3. For each directory under <path> that contains at least one indexed
+   function, write or update a CLAUDE.md:
+   - Build the auto-generated section from nest data.
+   - Preserve any user content above the sentinel comment.
+4. Error and exit 1 if the nest is empty (no indexed functions for
+   <path>).
+5. Print a summary: "Wrote <N> CLAUDE.md files in <root>."
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/verbs/egg.py`
+
+```python
+"""pidgin egg <path>: generate/update CLAUDE.md discovery files from
+the nest. Reads nest data; writes filesystem.
+"""
+
+import sys
+from pathlib import Path
+from collections import defaultdict
+
+EGG_SENTINEL = "<!-- egg:auto-generated below this line. Do not edit by hand. -->"
+
+def _group_functions_by_directory(records: list) -> dict[str, list]:
+    """records: iterable of FunctionRecord (or whatever the nest yields).
+    Return {dir_abs_path: [record, ...]}."""
+    groups: dict[str, list] = defaultdict(list)
+    for r in records:
+        groups[str(Path(r.file_path).parent)].append(r)
+    return groups
+
+def _build_auto_section(dir_path: str, records: list) -> str:
+    """Produce the markdown body that goes below the sentinel."""
+    by_file: dict[str, list] = defaultdict(list)
+    for r in records:
+        by_file[r.file_path].append(r)
+    lines = [f"# {Path(dir_path).name}/", ""]
+    for fp in sorted(by_file):
+        rel = str(Path(fp).relative_to(dir_path))
+        lines.append(f"## {rel}")
+        # File-level summary if available.
+        file_summary = getattr(by_file[fp][0], "file_summary", None)
+        if file_summary:
+            lines.append("")
+            lines.append(file_summary)
+        lines.append("")
+        lines.append("| Symbol | Kind | DOES |")
+        lines.append("|--------|------|------|")
+        for r in sorted(by_file[fp], key=lambda r: r.symbol_name):
+            kind = getattr(r, "symbol_kind", "function")
+            desc = (r.mld_description or "").replace("\n", " ").strip()
+            lines.append(f"| `{r.symbol_name}` | {kind} | {desc} |")
+        lines.append("")
+    return "\n".join(lines)
+
+def _splice_into_existing(existing: str, auto_section: str) -> str:
+    if EGG_SENTINEL in existing:
+        head, _, _ = existing.partition(EGG_SENTINEL)
+        return f"{head.rstrip()}\n\n{EGG_SENTINEL}\n\n{auto_section}\n"
+    if existing.strip():
+        return f"{existing.rstrip()}\n\n{EGG_SENTINEL}\n\n{auto_section}\n"
+    return f"{EGG_SENTINEL}\n\n{auto_section}\n"
+
+def run_egg(args) -> int:
+    from pidgin.store import nest as nest_store
+    from pidgin.utils.git import find_project_root
+
+    root = find_project_root(args.path) or args.path
+    records = list(nest_store.iter_records(root))   # see Anomaly note
+    if not records:
+        print(f"[egg] FATAL: nest at {root} is empty. Run `pidgin index` "
+              f"before `pidgin egg`.", file=sys.stderr)
+        return 1
+
+    # Filter records to those under args.path.
+    base = Path(args.path).resolve()
+    filtered = [r for r in records if Path(r.file_path).resolve().is_relative_to(base)]
+    if not filtered:
+        print(f"[egg] FATAL: no indexed functions under {args.path}.", file=sys.stderr)
+        return 1
+
+    groups = _group_functions_by_directory(filtered)
+    n_written = 0
+    for dir_path, recs in sorted(groups.items()):
+        auto = _build_auto_section(dir_path, recs)
+        target = Path(dir_path, "CLAUDE.md")
+        existing = target.read_text() if target.exists() else ""
+        target.write_text(_splice_into_existing(existing, auto))
+        n_written += 1
+    print(f"[egg] Wrote {n_written} CLAUDE.md files under {args.path}.")
+    return 0
+```
+
+**Anomaly note (executor):** the nest store may not currently expose an
+`iter_records(root)` helper. If it does not, add a minimal one in
+/project/pidgin/store/nest.py that yields the records the egg needs
+(file_path, symbol_name, symbol_kind, mld_description, file_summary).
+Document the addition in the report.
+
+**Wire into cli.py:**
+
+```python
+sp_egg = subparsers.add_parser(
+    "egg", help="Generate/update CLAUDE.md discovery files from the nest.")
+sp_egg.add_argument("path", help="Directory to walk (must be inside an indexed repo).")
+sp_egg.set_defaults(func=run_egg_main_entry)
+```
+
+**Test (manual smoke):**
+
+```bash
+cd /tmp && rm -rf m9-test && mkdir m9-test && cd m9-test && git init -q
+mkdir -p a b
+echo 'def f(): "Print f."; pass' > a/x.py
+echo 'def g(): "Print g."; pass' > b/y.py
+OPENAI_API_KEY=sk-... python -m pidgin index .
+python -m pidgin egg .
+test -f a/CLAUDE.md && test -f b/CLAUDE.md && echo PASS
+```
+
+The mission's verify phase exercises the import path only (no API call).
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/cli.py /tmp/cli.py.m9.bak && cp /project/pidgin/store/nest.py /tmp/nest.py.m9.bak`
+   FAIL: HARD
+2. Read /project/pidgin/store/nest.py to see if `iter_records` (or
+   equivalent) exists. If not, plan to add it.
+3. Read /project/pidgin/cli.py.
+
+**Phase 1 — Write**
+
+4. If iter_records is missing, edit /project/pidgin/store/nest.py to
+   add it (yield FunctionRecord-shaped objects with the fields the egg
+   needs).
+   FAIL: HARD
+5. Write /project/pidgin/verbs/egg.py per the specification.
+   FAIL: HARD
+6. Edit /project/pidgin/cli.py to register the egg subparser.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+7. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/verbs/egg.py').read()); ast.parse(open('/project/pidgin/cli.py').read()); ast.parse(open('/project/pidgin/store/nest.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+8. RUN: `python -c "from pidgin.verbs.egg import _build_auto_section, _splice_into_existing, EGG_SENTINEL; print('IMPORT_OK')"`
+   EXPECT CONTAINS: IMPORT_OK
+   FAIL: HARD
+9. RUN: `python -m pidgin egg --help`
+   EXPECT CONTAINS: egg
+   FAIL: SOFT
+
+**Phase 4 — Report**
+
+10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files written, files modified.
+- Whether iter_records was added to nest.py and its full signature.
+- Step results table.
+- Anomalies.
+- Rollback.
+      ]]></report>
+    </mission>
+
+    <mission n="10" tier="execute" review="true">
+      <context><![CDATA[
+New verb: depends. `pidgin depends <file.py>` shows the file's import
+graph: what it imports, and what other files in the indexed repo import
+it. Human-readable default; --json for LLM consumption.
+
+DP5: M12 (full import + signature tracking) lands later in this sprint.
+For M10, ship a minimal AST import extractor inline so the verb is
+functional standalone. M12 will replace the inline extractor with the
+canonical imports.json reader and enrich output with signatures.
+
+The dependency-graph store this mission produces is a small auxiliary
+JSON file at <git_root>/.pidgin/imports.minimal.json (different filename
+from M12's imports.json so they coexist during rollout). M12 deprecates
+this file and updates depends.py to read imports.json instead.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Create /project/pidgin/verbs/depends.py.
+2. Wire `depends` into /project/pidgin/cli.py with positional path
+   argument and --json flag.
+3. Implement minimal AST import extraction: walk every indexed file
+   under git root, record `from X import Y` and `import X` statements,
+   write to .pidgin/imports.minimal.json.
+4. Implement the depends query: read imports.minimal.json, for the
+   target file print (a) what it imports, (b) which files import it.
+5. The minimal extractor is automatically refreshed on every `depends`
+   call (small repos only — M12 ships incremental refresh during index).
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/verbs/depends.py`
+
+```python
+"""pidgin depends <file>: show the file's import graph.
+
+DP5 (v0.3): minimal inline extractor; M12 replaces with imports.json.
+"""
+
+import ast
+import json
+import sys
+from pathlib import Path
+from collections import defaultdict
+
+MINIMAL_IMPORTS_FILENAME = "imports.minimal.json"
+
+def _extract_minimal_imports(file_path: Path) -> list[dict]:
+    """Return a list of {'kind': 'import'|'from', 'module': str,
+    'names': [str], 'line': int}."""
+    try:
+        tree = ast.parse(file_path.read_text())
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out.append({"kind": "import", "module": alias.name,
+                            "names": [], "line": node.lineno})
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            out.append({"kind": "from", "module": module,
+                        "names": [a.name for a in node.names],
+                        "line": node.lineno})
+    return out
+
+def _build_minimal_graph(repo_root: Path) -> dict:
+    from pidgin.utils.parser import walk_source_files
+    graph = {"by_file": {}, "imported_by": defaultdict(list)}
+    for fp in walk_source_files(str(repo_root)):
+        rel = str(fp.relative_to(repo_root))
+        imps = _extract_minimal_imports(fp)
+        graph["by_file"][rel] = imps
+        for imp in imps:
+            graph["imported_by"][imp["module"]].append(rel)
+    graph["imported_by"] = dict(graph["imported_by"])  # for json
+    return graph
+
+def _save_graph(repo_root: Path, graph: dict) -> Path:
+    out_path = repo_root / ".pidgin" / MINIMAL_IMPORTS_FILENAME
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(graph, indent=2, sort_keys=True))
+    return out_path
+
+def _format_human(rel: str, imports: list[dict],
+                  imported_by: list[str]) -> str:
+    lines = [f"# depends: {rel}", ""]
+    lines.append("## Imports")
+    if not imports:
+        lines.append("_(none)_")
+    else:
+        for imp in imports:
+            if imp["kind"] == "import":
+                lines.append(f"- `import {imp['module']}` (line {imp['line']})")
+            else:
+                names = ", ".join(imp["names"]) or "*"
+                lines.append(f"- `from {imp['module']} import {names}` (line {imp['line']})")
+    lines.append("")
+    lines.append("## Imported by")
+    if not imported_by:
+        lines.append("_(none in this repo)_")
+    else:
+        for f in sorted(imported_by):
+            lines.append(f"- `{f}`")
+    return "\n".join(lines) + "\n"
+
+def run_depends(args) -> int:
+    from pidgin.utils.git import find_project_root
+    root = find_project_root(args.path)
+    if root is None:
+        print(f"[depends] FATAL: no .git found above {args.path}.",
+              file=sys.stderr)
+        return 1
+    repo_root = Path(root)
+    graph = _build_minimal_graph(repo_root)
+    _save_graph(repo_root, graph)
+
+    target = Path(args.path).resolve()
+    try:
+        rel = str(target.relative_to(repo_root))
+    except ValueError:
+        print(f"[depends] FATAL: {args.path} is outside {repo_root}.",
+              file=sys.stderr)
+        return 1
+
+    imports = graph["by_file"].get(rel, [])
+
+    # Crude reverse lookup: map this file to the module-style name it
+    # would be imported as. (M12 will improve this.)
+    rel_no_ext = rel[:-3] if rel.endswith(".py") else rel
+    candidate_module_names = {
+        rel_no_ext.replace("/", "."),
+        rel_no_ext.split("/")[-1],
+    }
+    imported_by: list[str] = []
+    for module, by in graph["imported_by"].items():
+        if module in candidate_module_names or any(
+            module.endswith("." + n) for n in candidate_module_names
+        ):
+            imported_by.extend(by)
+    imported_by = sorted(set(imported_by) - {rel})
+
+    if args.json:
+        sys.stdout.write(json.dumps(
+            {"file": rel, "imports": imports, "imported_by": imported_by},
+            indent=2, sort_keys=True))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(_format_human(rel, imports, imported_by))
+    return 0
+```
+
+**Wire into cli.py:**
+
+```python
+sp_depends = subparsers.add_parser(
+    "depends", help="Show import graph for a file.")
+sp_depends.add_argument("path", help="Path to a source file.")
+sp_depends.add_argument("--json", action="store_true",
+    help="JSON output (for LLM consumption).")
+sp_depends.set_defaults(func=run_depends_main_entry)
+```
+
+**Test (smoke):**
+
+```bash
+cd /tmp && rm -rf m10-test && mkdir m10-test && cd m10-test && git init -q
+echo "from helpers import h" > main.py
+echo "def h(): pass" > helpers.py
+python -m pidgin depends ./helpers.py
+# expected: helpers.py listed; imported by main.py
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/cli.py /tmp/cli.py.m10.bak && test -f /project/pidgin/verbs/depends.py && cp /project/pidgin/verbs/depends.py /tmp/depends.py.m10.bak || echo NO_PRIOR_FILE`
+   FAIL: HARD
+2. Read /project/pidgin/cli.py.
+3. Confirm /project/pidgin/utils/parser.py walk_source_files is callable
+   (M5 must have shipped).
+
+**Phase 1 — Write**
+
+4. Write /project/pidgin/verbs/depends.py.
+   FAIL: HARD
+5. Edit /project/pidgin/cli.py to register the depends subparser.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+6. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/verbs/depends.py').read()); ast.parse(open('/project/pidgin/cli.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+7. RUN: `python -c "from pidgin.verbs.depends import _extract_minimal_imports, _build_minimal_graph; print('IMPORT_OK')"`
+   EXPECT CONTAINS: IMPORT_OK
+   FAIL: HARD
+8. RUN: `bash -c 'rm -rf /tmp/m10-test && mkdir -p /tmp/m10-test && cd /tmp/m10-test && git init -q && echo "from helpers import h" > main.py && echo "def h(): pass" > helpers.py && python -m pidgin depends ./helpers.py'`
+   EXPECT CONTAINS: main.py
+   FAIL: HARD
+9. RUN: `bash -c 'cd /tmp/m10-test && python -m pidgin depends ./helpers.py --json'`
+   EXPECT CONTAINS: imported_by
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files written, files modified.
+- Smoke-test transcripts (verify steps 8 and 9 stdout).
+- Step results table.
+- Anomalies (especially: ambiguity in mapping a file path to a module
+  name — note any cases where reverse lookup missed obvious imports).
+- Rollback.
+      ]]></report>
+    </mission>
+
+    <mission n="11" tier="execute" review="true">
+      <context><![CDATA[
+Each MLD API call produces three sequential drafts (draft_1: 120 max
+tokens, draft_2: 80, draft_3: 60). Drafts 2 and 3 have prior drafts in
+context — they are refinements, not parallel samples.
+
+M11 adds analysis-only instrumentation: across all API calls for a
+function, compute separate centroids for draft_1s, draft_2s, draft_3s.
+Report cluster tightness per draft. Store per-draft centroid data in
+FunctionMldResult.
+
+This is data collection, not behaviour change. The pipeline still uses
+all candidates as before. DP2 dispositions whether a future change
+should weight or filter by draft based on the data this collects.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Extend FunctionMldResult (in /project/pidgin/pipeline/batch.py) with
+   per-draft centroid fields.
+2. After the pipeline collects all generated candidates per function,
+   group by draft index, compute centroid per group, compute mean
+   pairwise cosine similarity per group (cluster tightness proxy).
+3. Populate the new fields on the FunctionMldResult. Do not change any
+   other selection or convergence logic.
+4. Print a one-line per-function summary (only when --verbose) showing
+   draft tightness.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/pipeline/batch.py`
+
+Find the FunctionMldResult dataclass at line ~593. Add fields:
+
+```python
+@dataclass
+class FunctionMldResult:
+    # ... existing fields ...
+    per_draft_centroid: dict[int, list[float]] = field(default_factory=dict)
+    per_draft_tightness: dict[int, float] = field(default_factory=dict)
+    per_draft_n: dict[int, int] = field(default_factory=dict)
+```
+
+In `run_embedding_mld_pipeline_for_functions`, after the existing
+centroid + antipode logic for each function, add stratified analysis.
+The candidates list per function already carries the draft index (or
+will after the executor confirms in Phase 0 — if it does not, the
+executor extends the candidate dataclass to include draft_index, since
+draft_index is known at generation time):
+
+```python
+def _stratify(candidates) -> tuple[dict, dict, dict]:
+    """Group by draft_index. Return (centroid_per_draft,
+    tightness_per_draft, count_per_draft)."""
+    from collections import defaultdict
+    groups: dict[int, list] = defaultdict(list)
+    for c in candidates:
+        groups[c.draft_index].append(c.embedding)
+    centroid: dict[int, list[float]] = {}
+    tightness: dict[int, float] = {}
+    n_per: dict[int, int] = {}
+    for di, vecs in groups.items():
+        if not vecs:
+            continue
+        # centroid (mean across dims).
+        cent = [sum(v[i] for v in vecs) / len(vecs) for i in range(len(vecs[0]))]
+        # tightness = mean cosine_similarity to centroid.
+        from pidgin.pipeline.geometry import cosine_similarity
+        tight = sum(cosine_similarity(v, cent) for v in vecs) / len(vecs)
+        centroid[di] = cent
+        tightness[di] = tight
+        n_per[di] = len(vecs)
+    return centroid, tightness, n_per
+```
+
+Wire it in (around line 822 where FunctionMldResult is appended):
+
+```python
+cent, tight, n_per = _stratify(candidates_for_function)
+output.append(FunctionMldResult(
+    # ... existing fields ...,
+    per_draft_centroid=cent,
+    per_draft_tightness=tight,
+    per_draft_n=n_per,
+))
+if verbose:
+    parts = ", ".join(f"d{di}:{tight[di]:.3f} (n={n_per[di]})"
+                      for di in sorted(tight))
+    print(f"[mld] {func.name}: {parts}", file=sys.stderr)
+```
+
+If the candidate object lacks `draft_index`, extend the candidate
+dataclass to record it at generation time. Document the change in the
+report.
+
+**Test:**
+
+Manual smoke test with two trivial functions and the sync path:
+
+```python
+python -c "
+from pidgin.pipeline.batch import run_embedding_mld_pipeline_for_functions
+from pidgin.utils.parser import walk_source_files, extract_public_functions  # if shape exists
+import tempfile, os
+# ... call sync path on 2 functions, assert per_draft_tightness keys are
+# {1, 2, 3} and values are floats."
+```
+
+If extract_public_functions does not exist by that name, the executor
+adapts to the actual parser API and documents.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/pipeline/batch.py /tmp/batch.py.m11.bak`
+   FAIL: HARD
+2. Read /project/pidgin/pipeline/batch.py around lines 585-830 to map
+   the FunctionMldResult shape and the candidate-collection logic.
+3. Confirm whether candidate objects already carry draft_index. If not,
+   extend the candidate dataclass and the generation-result parser.
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/pipeline/batch.py — add the three FunctionMldResult
+   fields.
+   FAIL: HARD
+5. Edit /project/pidgin/pipeline/batch.py — add _stratify and wire it
+   into run_embedding_mld_pipeline_for_functions.
+   FAIL: HARD
+6. Edit /project/pidgin/pipeline/batch.py — if candidate did not carry
+   draft_index, extend the candidate dataclass and update the
+   generation-result parser to populate it.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+7. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/pipeline/batch.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+8. RUN: `python -c "from pidgin.pipeline.batch import FunctionMldResult; r = FunctionMldResult.__dataclass_fields__; assert 'per_draft_centroid' in r and 'per_draft_tightness' in r and 'per_draft_n' in r; print('SCHEMA_OK')"`
+   EXPECT CONTAINS: SCHEMA_OK
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+9. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- Whether candidate objects already carried draft_index, or whether the
+  dataclass was extended; if extended, paste the new field declaration.
+- The exact location (line numbers) of _stratify and the wire-in.
+- Step results table.
+- Anomalies.
+- Rollback: `cp /tmp/batch.py.m11.bak /project/pidgin/pipeline/batch.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="12" tier="execute" review="true">
+      <context><![CDATA[
+M5 added file filtering. M10 added a minimal AST import extractor for
+the depends verb. M12 replaces the minimal extractor with full AST
+metadata: imports, function signatures with type hints, parameter
+names+types, return type, decorators. Output: imports.json at
+.pidgin/imports.json (canonical). Build a dependency graph: file A
+imports X from file B.
+
+depends.py (M10) should detect imports.json and prefer it over
+imports.minimal.json. The minimal file becomes vestigial — M19 cleanup
+removes its writer.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Extend /project/pidgin/utils/parser.py to extract:
+   - import statements (already in M10's minimal extractor — share
+     code).
+   - function signature: name, parameters (name + annotation + default),
+     return annotation, decorator list, source line.
+2. Define a canonical imports.json schema and writer.
+3. Hook the canonical writer into the index verb so imports.json is
+   refreshed at the end of every index run.
+4. Update /project/pidgin/store/nest.py: store the function signature
+   metadata alongside MLD descriptions on FunctionRecord.
+5. Update /project/pidgin/verbs/depends.py to prefer imports.json over
+   imports.minimal.json when both exist.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/utils/parser.py`
+
+Add:
+
+```python
+from dataclasses import dataclass, field, asdict
+
+@dataclass
+class ParameterMeta:
+    name: str
+    annotation: str | None
+    default: str | None        # repr of default literal, or None
+    kind: str                  # "positional" | "keyword" | "vararg" | "kwarg"
+
+@dataclass
+class FunctionSignature:
+    name: str
+    parameters: list[ParameterMeta]
+    return_annotation: str | None
+    decorators: list[str]
+    line: int
+    is_async: bool
+
+@dataclass
+class ImportMeta:
+    kind: str                  # "import" | "from"
+    module: str
+    names: list[str]
+    line: int
+
+@dataclass
+class FileMeta:
+    path: str                  # relative to repo root
+    imports: list[ImportMeta]
+    functions: list[FunctionSignature]
+
+def _annotation_str(node) -> str | None:
+    if node is None:
+        return None
+    try:
+        import ast
+        return ast.unparse(node)
+    except Exception:
+        return None
+
+def extract_file_meta(repo_root: str, file_abs_path: str) -> FileMeta:
+    import ast
+    text = open(file_abs_path).read()
+    tree = ast.parse(text)
+    rel = str(Path(file_abs_path).relative_to(repo_root))
+    imports = []
+    functions = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(ImportMeta("import", alias.name, [], node.lineno))
+        elif isinstance(node, ast.ImportFrom):
+            imports.append(ImportMeta(
+                "from", node.module or "",
+                [a.name for a in node.names], node.lineno))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            params = []
+            args = node.args
+            for a in args.args:
+                params.append(ParameterMeta(
+                    a.arg, _annotation_str(a.annotation), None, "positional"))
+            if args.vararg:
+                params.append(ParameterMeta(
+                    args.vararg.arg, _annotation_str(args.vararg.annotation),
+                    None, "vararg"))
+            for a in args.kwonlyargs:
+                params.append(ParameterMeta(
+                    a.arg, _annotation_str(a.annotation), None, "keyword"))
+            if args.kwarg:
+                params.append(ParameterMeta(
+                    args.kwarg.arg, _annotation_str(args.kwarg.annotation),
+                    None, "kwarg"))
+            # defaults: zip from the right.
+            defaults = list(args.defaults)
+            for p, d in zip(reversed(params[:len(args.args)]), reversed(defaults)):
+                p.default = _annotation_str(d) or "?"
+            for p, d in zip(args.kwonlyargs, args.kw_defaults):
+                if d is not None:
+                    next(pp for pp in params if pp.name == p.arg).default = _annotation_str(d) or "?"
+            functions.append(FunctionSignature(
+                name=node.name,
+                parameters=params,
+                return_annotation=_annotation_str(node.returns),
+                decorators=[_annotation_str(d) or "" for d in node.decorator_list],
+                line=node.lineno,
+                is_async=isinstance(node, ast.AsyncFunctionDef),
+            ))
+    return FileMeta(path=rel, imports=imports, functions=functions)
+```
+
+**imports.json schema (canonical):**
+
+```json
+{
+  "version": 1,
+  "files": {
+    "<rel_path>": {
+      "imports": [{"kind": "from", "module": "...", "names": ["..."], "line": 1}],
+      "functions": [{
+        "name": "...",
+        "parameters": [{"name": "x", "annotation": "int", "default": null, "kind": "positional"}],
+        "return_annotation": "str",
+        "decorators": ["staticmethod"],
+        "line": 12,
+        "is_async": false
+      }]
+    }
+  },
+  "imported_by": {
+    "<module_name>": ["<rel_path>", "..."]
+  }
+}
+```
+
+**Writer:**
+
+```python
+def write_imports_json(repo_root: str, files: list[FileMeta]) -> str:
+    from collections import defaultdict
+    inverted = defaultdict(list)
+    out_files = {}
+    for fm in files:
+        out_files[fm.path] = {
+            "imports": [asdict(i) for i in fm.imports],
+            "functions": [asdict(f) for f in fm.functions],
+        }
+        for imp in fm.imports:
+            inverted[imp.module].append(fm.path)
+    payload = {
+        "version": 1,
+        "files": out_files,
+        "imported_by": dict(inverted),
+    }
+    out_path = Path(repo_root) / ".pidgin" / "imports.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return str(out_path)
+```
+
+**File:** `/project/pidgin/verbs/index.py`
+
+After the MLD pipeline completes, invoke the parser over every walked
+file and write imports.json:
+
+```python
+from pidgin.utils.parser import walk_source_files, extract_file_meta, write_imports_json
+metas = [extract_file_meta(repo_root, str(p))
+         for p in walk_source_files(args.path, exclude_globs=args.exclude)]
+write_imports_json(repo_root, metas)
+```
+
+**File:** `/project/pidgin/store/nest.py`
+
+Extend FunctionRecord with optional fields:
+- `signature: FunctionSignature | None` (or its asdict-equivalent).
+- `decorators: list[str]`.
+
+These are stored as part of the existing FunctionRecord upsert. If the
+schema must be migrated for existing nests, document the migration in
+the report (a new field defaults to None for older records — Chroma
+metadata is permissive).
+
+**File:** `/project/pidgin/verbs/depends.py`
+
+In run_depends, prefer imports.json over imports.minimal.json when
+both exist. If imports.json is present, use its `imported_by` index
+directly (much more accurate than the M10 reverse-lookup heuristic).
+
+**Test:**
+
+```bash
+cd /tmp && rm -rf m12-test && mkdir m12-test && cd m12-test && git init -q
+echo "from typing import Any
+@staticmethod
+def double(x: int = 1) -> int: return x*2" > x.py
+python -c "from pidgin.utils.parser import extract_file_meta; import json; m = extract_file_meta('/tmp/m12-test', '/tmp/m12-test/x.py'); from dataclasses import asdict; print(json.dumps(asdict(m), indent=2))"
+# expected: functions[0].name == 'double', parameters[0].annotation == 'int', return_annotation == 'int'
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/utils/parser.py /tmp/parser.py.m12.bak && cp /project/pidgin/verbs/index.py /tmp/index.py.m12.bak && cp /project/pidgin/store/nest.py /tmp/nest.py.m12.bak && cp /project/pidgin/verbs/depends.py /tmp/depends.py.m12.bak`
+   FAIL: HARD
+2. Read /project/pidgin/utils/parser.py.
+3. Read /project/pidgin/store/nest.py to find FunctionRecord.
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/utils/parser.py — add ParameterMeta,
+   FunctionSignature, ImportMeta, FileMeta, _annotation_str,
+   extract_file_meta, write_imports_json. Use ast.unparse.
+   FAIL: HARD
+5. Edit /project/pidgin/verbs/index.py — call extract_file_meta over
+   each walked file and write imports.json after the pipeline finishes.
+   FAIL: HARD
+6. Edit /project/pidgin/store/nest.py — extend FunctionRecord with
+   optional signature and decorators fields; ensure upsert handles them.
+   FAIL: HARD
+7. Edit /project/pidgin/verbs/depends.py — prefer imports.json when
+   present; use its `imported_by` directly.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+8. RUN: `python -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/project/pidgin/**/*.py', recursive=True)]"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+9. RUN: `bash -c 'rm -rf /tmp/m12-test && mkdir /tmp/m12-test && cd /tmp/m12-test && git init -q && printf "%s\n" "def double(x: int = 1) -> int: return x*2" > x.py && python -c "from pidgin.utils.parser import extract_file_meta; from dataclasses import asdict; import json; print(json.dumps(asdict(extract_file_meta(\"/tmp/m12-test\",\"/tmp/m12-test/x.py\")), indent=2))"'`
+   EXPECT CONTAINS: "name": "double"
+   EXPECT CONTAINS: "return_annotation": "int"
+   FAIL: HARD
+10. RUN: `python -c "from pidgin.utils.parser import write_imports_json, extract_file_meta; print('IMPORT_OK')"`
+    EXPECT CONTAINS: IMPORT_OK
+    FAIL: HARD
+
+**Phase 4 — Report**
+
+11. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- imports.json schema as written (paste a sample from the smoke test).
+- The exact field declarations added to FunctionRecord and how the
+  nest upsert was updated.
+- Confirmation that depends.py now prefers imports.json.
+- Step results table.
+- Anomalies.
+- Rollback (4-file restore).
+      ]]></report>
+    </mission>
+
+    <mission n="13" tier="reason" review="true">
+      <context><![CDATA[
+Currently, every `pidgin index` run re-MLDs every public function from
+scratch. M13 makes index idempotent. Per function, store
+source_hash = sha256(function_body) in the nest. On re-index:
+  - Hash unchanged → skip (no API call).
+  - Hash changed → re-MLD and update the record.
+  - Function present in nest but absent from the source tree → prune.
+
+Report: "N unchanged, M updated, K deleted."
+
+Architectural judgement required:
+  - Definition of "function body" for hashing — body source vs body+sig?
+    Recommend body+sig so signature-only changes (annotation update)
+    re-MLD. Document the choice.
+  - Pruning semantics: hard-delete on nest, or soft-tombstone? Hard-
+    delete is simplest; document any cross-references that break.
+  - Concurrency: index is single-process today, so no locking needed —
+    document this assumption.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Extend FunctionRecord with `source_hash: str` (sha256 of the
+   normalised function source).
+2. Add a normalised-source helper that turns an AST function node into
+   a hashable string (body + signature, excluding line numbers and
+   trailing whitespace).
+3. Add a diff helper that, given (old_records_in_nest,
+   new_functions_extracted), classifies each into UNCHANGED, UPDATED,
+   NEW, DELETED.
+4. Update the index verb to consume the diff: skip UNCHANGED, MLD only
+   NEW + UPDATED, prune DELETED.
+5. Print the summary: "N unchanged, M updated, K new, J deleted".
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/utils/parser.py`
+
+Add:
+
+```python
+import hashlib
+import ast
+
+def _normalise_function_source(node) -> str:
+    """Stable string for hashing. body + signature; ignores line numbers
+    and column offsets via ast.unparse on a freshly-built tree.
+    Comments and docstrings ARE included (docstring change → re-MLD).
+    """
+    return ast.unparse(node)
+
+def function_source_hash(node) -> str:
+    return hashlib.sha256(
+        _normalise_function_source(node).encode("utf-8")
+    ).hexdigest()
+```
+
+**File:** `/project/pidgin/store/nest.py`
+
+Extend FunctionRecord with `source_hash: str = ""`. Migration: existing
+records without a hash count as UPDATED on first re-index (forces re-MLD
+once).
+
+Add a helper:
+
+```python
+@dataclass
+class IdempotencyDiff:
+    unchanged: list           # FunctionRecord
+    updated:   list           # tuple(FunctionRecord_old, new_function_node)
+    new:       list           # function_node (no record yet)
+    deleted:   list           # FunctionRecord (no longer in source)
+
+def diff_against_nest(
+    repo_root: str,
+    new_functions: list,     # iterable of (file_rel_path, function_node)
+) -> IdempotencyDiff:
+    """Compare hashes. Identity key: (file_rel_path, function_name)."""
+```
+
+**File:** `/project/pidgin/verbs/index.py`
+
+After the parser walk, before MLD:
+
+```python
+diff = diff_against_nest(repo_root, parsed_functions)
+print(f"[index] unchanged={len(diff.unchanged)} "
+      f"updated={len(diff.updated)} "
+      f"new={len(diff.new)} "
+      f"deleted={len(diff.deleted)}")
+
+# MLD only the changed ones.
+to_mld = [n for _, n in diff.updated] + diff.new
+results = run_embedding_mld_pipeline_for_functions(to_mld, ...)
+
+# Upsert results, prune DELETED.
+nest_store.upsert_results(results)
+nest_store.prune([r.id for r in diff.deleted])
+```
+
+**File-summary regeneration gating (interaction with M6):**
+
+M6 generates a one-paragraph file-level summary as a byproduct of index
+(one extra gpt-4.1-nano call per file). M13 idempotency MUST gate this
+call too — otherwise re-indexing an unchanged repo still spends N
+nano-calls per file for summaries that will not change.
+
+Rule: regenerate the file-level summary for a file IF AND ONLY IF the
+file contains at least one function in `diff.new` or `diff.updated`, OR
+contains at least one function in `diff.deleted`. If every function in
+the file is in `diff.unchanged`, skip the summary call and retain the
+existing file_summary on the corresponding nest record(s).
+
+Implementation:
+
+```python
+# Compute the set of files with any non-unchanged function.
+changed_files: set[str] = set()
+for _, node in diff.updated:
+    changed_files.add(node._file_rel_path)   # threaded through during parse
+for node in diff.new:
+    changed_files.add(node._file_rel_path)
+for rec in diff.deleted:
+    changed_files.add(rec.file_path)
+
+# In M6's post-MLD file-summary loop, gate by changed_files:
+for fp, fn_results in results_by_file.items():
+    if fp not in changed_files:
+        continue   # idempotent skip
+    # ... synthesise summary, upsert ...
+```
+
+The `_file_rel_path` annotation may need to be threaded onto the parsed
+AST function node at parse time (extra attribute on the dataclass that
+wraps the node — confirm in Phase 0). Document the threading mechanism
+in the report.
+
+**Architectural decisions to document in the report:**
+
+1. **Hash domain:** body + signature (via ast.unparse). Annotation
+   changes trigger re-MLD. Indentation differences in the source
+   normalise out.
+2. **Pruning:** hard-delete from nest. There is no caller depending on
+   tombstoned function records. Document if Phase 0 reveals any.
+3. **Concurrency:** assumed single-process. No locking. If a future
+   parallel-index ships, it must implement file-level locking on
+   .pidgin/.
+4. **File-summary gating:** regenerate IFF the file has any
+   new/updated/deleted function. Otherwise the file_summary is
+   considered stable and reused. Reasoning: a file's role is a function
+   of its public surface; if the surface is byte-stable, the summary
+   need not change.
+
+**Test:**
+
+```bash
+cd /tmp && rm -rf m13-test && mkdir m13-test && cd m13-test && git init -q
+echo "def f(): return 1" > x.py
+OPENAI_API_KEY=$KEY python -m pidgin index .
+# expected: unchanged=0 updated=0 new=1 deleted=0
+OPENAI_API_KEY=$KEY python -m pidgin index .
+# expected: unchanged=1 updated=0 new=0 deleted=0  (zero API calls)
+echo "def f(): return 2" > x.py
+OPENAI_API_KEY=$KEY python -m pidgin index .
+# expected: unchanged=0 updated=1 new=0 deleted=0
+rm x.py && touch y.py && echo "def g(): return 3" > y.py
+OPENAI_API_KEY=$KEY python -m pidgin index .
+# expected: unchanged=0 updated=0 new=1 deleted=1
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/utils/parser.py /tmp/parser.py.m13.bak && cp /project/pidgin/store/nest.py /tmp/nest.py.m13.bak && cp /project/pidgin/verbs/index.py /tmp/index.py.m13.bak`
+   FAIL: HARD
+2. Read /project/pidgin/store/nest.py FunctionRecord and the
+   upsert/prune helpers (or note absence).
+3. Read /project/pidgin/verbs/index.py post-MLD code.
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/utils/parser.py — add _normalise_function_source
+   and function_source_hash.
+   FAIL: HARD
+5. Edit /project/pidgin/store/nest.py — extend FunctionRecord,
+   add diff_against_nest and (if missing) prune helper.
+   FAIL: HARD
+6. Edit /project/pidgin/verbs/index.py — gate MLD on diff; print
+   summary; prune deleted.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+7. RUN: `python -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/project/pidgin/**/*.py', recursive=True)]"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+8. RUN: `python -c "from pidgin.utils.parser import function_source_hash; import ast; t = ast.parse('def f(): return 1'); h1 = function_source_hash(t.body[0]); t2 = ast.parse('def f(): return 1'); h2 = function_source_hash(t2.body[0]); assert h1 == h2; t3 = ast.parse('def f(): return 2'); h3 = function_source_hash(t3.body[0]); assert h1 != h3; print('HASH_OK')"`
+   EXPECT CONTAINS: HASH_OK
+   FAIL: HARD
+9. RUN: `python -c "from pidgin.store.nest import diff_against_nest, IdempotencyDiff; print('SCHEMA_OK')"`
+   EXPECT CONTAINS: SCHEMA_OK
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- Architectural decisions (hash domain, pruning semantics, concurrency,
+  file-summary gating) with reasoning, including any deviations from
+  the spec defaults.
+- The exact diff_against_nest signature and IdempotencyDiff schema.
+- The exact mechanism by which `_file_rel_path` (or equivalent) was
+  threaded onto parsed function nodes for the file-summary gate.
+- Step results table.
+- Anomalies (especially: behaviour for records that pre-date the
+  source_hash field).
+- Rollback (3-file restore).
+      ]]></report>
+    </mission>
+
+    <mission n="14" tier="reason" review="true">
+      <context><![CDATA[
+Today, run_embedding_mld_pipeline_for_functions takes n_calls=5 (15
+candidates per function). Always runs 5 calls regardless of whether the
+candidates already cluster.
+
+M14 replaces fixed n_calls with convergence-based stopping. After each
+batch of calls, compute the centroid; if cosine_similarity(centroid_n,
+centroid_{n-1}) > 0.99, stop early. Cap at 5 batches (50 candidates max).
+
+Architectural judgement:
+  - Batch granularity inside a single function: stay with the existing
+    "1 batch = 1 API call producing 3 drafts" definition unless the
+    pipeline already coalesces multiple calls per dispatch round.
+    Document the chosen granularity.
+  - Initial threshold: 0.99 cosine similarity between consecutive
+    centroids. If a function does not converge by batch 5, accept the
+    last centroid and flag low-convergence in the result.
+  - Sync vs batch path: the convergence-stop optimisation matters most
+    on the sync path (token cost per call). On batch path, candidate
+    cost is amortised across the batch — convergence stop is still
+    valuable but secondary. Implement uniformly across both.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Replace the fixed-n_calls loop in
+   run_embedding_mld_pipeline_for_functions with a while loop that
+   computes the centroid after each batch and stops when delta < 0.01.
+2. Cap at 5 batches (50 candidates).
+3. Record `n_batches_run` and `final_convergence_delta` on
+   FunctionMldResult.
+4. Print convergence-rate summary at end of pipeline (only --verbose):
+   "<N> functions: median 2 batches, range 1-5".
+5. Sync and batch paths share the convergence loop where possible.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/pipeline/batch.py`
+
+Replace:
+
+```python
+def run_embedding_mld_pipeline_for_functions(
+    funcs, n_calls=5, ...
+) -> list[FunctionMldResult]:
+    ...
+    for ci in range(n_calls):
+        ...
+```
+
+With:
+
+```python
+ADAPTIVE_CONVERGENCE_THRESHOLD = 0.99
+ADAPTIVE_MAX_BATCHES = 5
+ADAPTIVE_INITIAL_BATCHES = 2  # always run at least 2 to compute a delta
+
+def run_embedding_mld_pipeline_for_functions(
+    funcs,
+    *,
+    max_batches: int = ADAPTIVE_MAX_BATCHES,
+    convergence_threshold: float = ADAPTIVE_CONVERGENCE_THRESHOLD,
+    dispatch: str = "auto",
+    verbose: bool = False,
+) -> list[FunctionMldResult]:
+    """Adaptive convergence-based stopping. Runs at least
+    ADAPTIVE_INITIAL_BATCHES batches per function, then stops early
+    when consecutive centroids cluster within `convergence_threshold`
+    cosine similarity. Caps at `max_batches`.
+    """
+```
+
+**Inner loop per function:**
+
+```python
+candidates: list = []
+prev_centroid = None
+final_delta: float | None = None
+n_batches = 0
+for batch_idx in range(max_batches):
+    new_candidates = _generate_one_batch(func, dispatch=dispatch)
+    candidates.extend(new_candidates)
+    n_batches += 1
+    if batch_idx + 1 < ADAPTIVE_INITIAL_BATCHES:
+        continue
+    cent = _centroid([c.embedding for c in candidates])
+    if prev_centroid is not None:
+        delta = cosine_similarity(cent, prev_centroid)
+        final_delta = delta
+        if delta >= convergence_threshold:
+            break
+    prev_centroid = cent
+output.append(FunctionMldResult(
+    # ... existing fields ...,
+    n_batches_run=n_batches,
+    final_convergence_delta=final_delta,
+))
+```
+
+**Backward compatibility:** the old `n_calls=5` keyword is preserved as
+a deprecated alias for max_batches; if passed, it logs a one-time
+DeprecationWarning and is mapped to max_batches.
+
+**FunctionMldResult fields (new):**
+
+```python
+n_batches_run: int = 0
+final_convergence_delta: float | None = None
+```
+
+**Pipeline post-summary:**
+
+```python
+if verbose:
+    counts = [r.n_batches_run for r in output]
+    if counts:
+        counts.sort()
+        median = counts[len(counts) // 2]
+        print(f"[mld] {len(counts)} functions: median {median} batches, "
+              f"range {counts[0]}-{counts[-1]}", file=sys.stderr)
+```
+
+**Reason-tier judgement to document in the report:**
+
+1. **Convergence threshold of 0.99:** chosen against v0.1 M3 data
+   (cluster cosine_similarity to centroid was empirically 0.97-0.999
+   for converged candidates, <0.95 for divergent). Document the
+   reasoning.
+2. **Batch granularity:** confirm whether the existing pipeline already
+   issues multiple API calls per "batch" inside the per-function loop;
+   if so, preserve that grouping and only gate the OUTER loop.
+3. **Sync vs batch:** explain how the loop interacts with batched
+   dispatch (the batch path may already submit n_calls × n_funcs in one
+   shot — adapting that path to early-stop requires either submitting
+   in waves or accepting that batch path runs full max_batches). Default
+   for v0.3: batch path runs full max_batches (no early stop), sync path
+   honours the threshold. Document this.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/pipeline/batch.py /tmp/batch.py.m14.bak`
+   FAIL: HARD
+2. Read /project/pidgin/pipeline/batch.py lines 593-830 to map the
+   per-function loop and dispatch path.
+
+**Phase 1 — Write**
+
+3. Edit /project/pidgin/pipeline/batch.py — add the four constants,
+   refactor run_embedding_mld_pipeline_for_functions to the adaptive
+   loop, add the two FunctionMldResult fields, preserve n_calls as
+   deprecated alias, add the verbose summary.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+4. RUN: `python -c "import ast; ast.parse(open('/project/pidgin/pipeline/batch.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+5. RUN: `python -c "from pidgin.pipeline.batch import FunctionMldResult, ADAPTIVE_MAX_BATCHES, ADAPTIVE_CONVERGENCE_THRESHOLD; r = FunctionMldResult.__dataclass_fields__; assert 'n_batches_run' in r and 'final_convergence_delta' in r; print('OK')"`
+   EXPECT CONTAINS: OK
+   FAIL: HARD
+6. RUN: `python -c "from pidgin.pipeline.batch import run_embedding_mld_pipeline_for_functions as f; import inspect; sig = inspect.signature(f); assert 'max_batches' in sig.parameters; assert 'convergence_threshold' in sig.parameters; print('SIG_OK')"`
+   EXPECT CONTAINS: SIG_OK
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+7. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- Architectural decisions (threshold, batch granularity, sync vs batch
+  early-stop) with reasoning.
+- Whether n_calls deprecation alias was implemented and how it surfaces
+  the warning.
+- Step results table.
+- Anomalies — especially any code paths that called
+  run_embedding_mld_pipeline_for_functions with positional n_calls and
+  required updating.
+- Rollback: `cp /tmp/batch.py.m14.bak /project/pidgin/pipeline/batch.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="15" tier="execute" review="true">
+      <context><![CDATA[
+v0.2 deferred bidirectional MLD (description→code) at the Phase 4 gate.
+The geometry was sound; the JSON response envelope truncated at 50/200
+token budgets when generating code bodies. Two pre-conditions for
+re-gate:
+
+1. Raise the bidirectional token budget to 1000 (5x). Current generation
+   prompts (expand.xml) limit max_tokens to 200; budget at 1000 should
+   cover 40-line function bodies.
+2. Switch expand.xml from JSON-schema response_format to tool-use
+   structured output. Tool-use does not require closing braces; every
+   v0.2 truncation was the JSON envelope, not the body.
+
+The probes harness for the re-gate lives at
+/project/local/sprints/tooling-v0.3/probes/m14-bidirectional/. Copy from
+the v0.2 location (/project/local/sprints/tooling-v0.2/probes/m14-bidirectional/)
+and update for the new envelope.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Update /project/pidgin/prompts/expand.xml: response_format
+   JSON-schema → tool-use structured output.
+2. Bump the budget constant in the bidirectional pipeline (probably
+   /project/pidgin/pipeline/batch.py or a constants module — confirm in
+   Phase 0): default token budget for expand calls 200 → 1000.
+3. Provision the v0.3 probe directory by copying the v0.2 layout, then
+   patch harness_fast.py to use the new tool-use envelope and the 1000
+   budget.
+4. Smoke-test that a single 40-line probe generates a complete function
+   body without truncation.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Source dir to copy:** `/project/local/sprints/tooling-v0.2/probes/m14-bidirectional/`
+**Target dir:**         `/project/local/sprints/tooling-v0.3/probes/m14-bidirectional/`
+
+Copy all files; do not modify the v0.2 originals.
+
+**File:** `/project/pidgin/prompts/expand.xml`
+
+Locate the existing `<response_format>` (or equivalent tag) declaring
+JSON-schema. Replace with a tool-use specification:
+
+```xml
+<output>
+  <tool_use>
+    <tool name="emit_code">
+      <param name="body" type="string"
+             description="The complete function body, including the def
+             header. Multi-line. No surrounding markdown fences."/>
+    </tool>
+  </tool_use>
+</output>
+```
+
+The probe harness consumes the tool-use response and reads the `body`
+parameter directly (no JSON parsing).
+
+**Budget:**
+
+In whichever module declares the bidirectional/expand token budget
+(likely `pidgin/pipeline/batch.py` or `pidgin/prompts/templates.py`),
+change the default for expand-style calls 200 → 1000. Add a constant:
+
+```python
+BIDIRECTIONAL_MAX_TOKENS = 1000
+```
+
+If the budget is currently inline at the call site, replace with the
+constant.
+
+**Probe harness update:**
+
+`/project/local/sprints/tooling-v0.3/probes/m14-bidirectional/harness_fast.py`
+
+The existing harness sends an OpenAI chat.completions.create call with
+response_format=json_schema. Change to tool-use:
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "emit_code",
+        "description": "Emit the function body for the described function.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "body": {"type": "string",
+                         "description": "Complete function body."},
+            },
+            "required": ["body"],
+        },
+    },
+}]
+
+resp = client.chat.completions.create(
+    model="gpt-4.1-nano",
+    messages=[{"role": "user", "content": prompt}],
+    tools=tools,
+    tool_choice={"type": "function", "function": {"name": "emit_code"}},
+    max_tokens=BIDIRECTIONAL_MAX_TOKENS,
+    temperature=0.7,
+)
+
+call = resp.choices[0].message.tool_calls[0]
+body = json.loads(call.function.arguments)["body"]
+```
+
+**Smoke test (smoke step in verify):**
+
+A trivial probe described as "function that takes a list of ints and
+returns the running maximum at each position, length up to 40 lines":
+verify the output `body` parses as Python (ast.parse succeeds) and is
+not truncated mid-statement.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/prompts/expand.xml /tmp/expand.xml.m15.bak`
+   FAIL: HARD
+2. RUN: `test -d /project/local/sprints/tooling-v0.2/probes/m14-bidirectional && echo SOURCE_EXISTS || echo MISSING`
+   EXPECT CONTAINS: SOURCE_EXISTS
+   FAIL: HARD
+3. Read /project/pidgin/prompts/expand.xml fully.
+4. Read /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/harness_fast.py.
+5. RUN: `grep -rn "max_tokens\|response_format\|expand" /project/pidgin/pipeline/ /project/pidgin/prompts/ --include='*.py' --include='*.xml'`
+   FAIL: SOFT
+
+**Phase 1 — Write**
+
+6. RUN: `mkdir -p /project/local/sprints/tooling-v0.3/probes/m14-bidirectional && cp -r /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/. /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+7. Edit /project/pidgin/prompts/expand.xml — replace
+   `<response_format>` block with `<output><tool_use>...` per spec.
+   FAIL: HARD
+8. Add BIDIRECTIONAL_MAX_TOKENS = 1000 in the appropriate module and
+   replace the inline 200 budget.
+   FAIL: HARD
+9. Edit /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/harness_fast.py
+   to use tool-use, BIDIRECTIONAL_MAX_TOKENS, and parse the tool_calls
+   response.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+10. RUN: `python -c "import xml.etree.ElementTree as ET; ET.parse('/project/pidgin/prompts/expand.xml')"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+11. RUN: `grep -n "BIDIRECTIONAL_MAX_TOKENS = 1000\|max_tokens.*BIDIRECTIONAL_MAX_TOKENS" /project/pidgin/`
+    FAIL: SOFT
+12. RUN: `grep -rn "BIDIRECTIONAL_MAX_TOKENS\|tool_choice" /project/pidgin/ /project/local/sprints/tooling-v0.3/probes/`
+    EXPECT CONTAINS: BIDIRECTIONAL_MAX_TOKENS
+    FAIL: HARD
+13. RUN: `python -c "import ast; ast.parse(open('/project/local/sprints/tooling-v0.3/probes/m14-bidirectional/harness_fast.py').read())"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+
+**Phase 4 — Report**
+
+14. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified, files copied.
+- The before/after of the response_format → tool-use block in expand.xml
+  (paste both verbatim).
+- The exact module where BIDIRECTIONAL_MAX_TOKENS was declared.
+- Step results table.
+- Anomalies (e.g. multiple call sites for the budget).
+- Rollback: list the cp restore + the v0.3 probe dir removal.
+      ]]></report>
+    </mission>
+
+    <mission n="16" tier="execute" review="false">
+      <context><![CDATA[
+M15 fixed the budget and envelope. M16 re-runs the 5 v0.2 bidirectional
+probes with the fixed harness. Probes:
+  P1 (one-liner; description was too generic in v0.2 — fix in this
+     mission), P2 (small function; reference was wrong in v0.2 — fix),
+  P3 (medium; passed verbatim 3/3 at b=200 in v0.2), P4 (one-liner;
+  passed 5/5 byte-equal in v0.2), P5 (40-line function; never produced
+  valid Python in v0.2).
+
+Run each probe 6 times. 30 records total. Persist to results.json with
+per-probe status fields (`generated_body`, `parses_as_python`,
+`matches_reference`, `truncated`).
+
+Gate criteria from design Decision 1 / DP1: 4/5 stable+correct →
+UNLOCK, 3/5 → AMBIGUOUS, <3 → DEFER.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Edit probes.json: fix P1 description (replace v0.2 generic phrasing
+   with a description that names the exact algorithm). Fix P2 reference
+   (point to the correct expected body — Phase 0 reads the v0.2
+   harness/log.md to discover the correct reference).
+2. Run all 5 probes × 6 times = 30 records via harness_fast.py.
+3. Persist results to /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/results.json.
+4. Report per-probe pass rate.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Probe spec edits (probes.json):**
+
+The executor first reads the v0.2 probes.json + log.md and the v0.2 GATE.md
+to determine the corrections:
+  - P1 generic-description issue: log.md should record what was
+    insufficient.
+  - P2 wrong-reference issue: log.md (or GATE.md) names the correct
+    reference function. If neither file resolves it definitively, the
+    executor flags it as an Anomaly and proceeds with a documented
+    best-effort correction (e.g. use the same source as P3 with
+    different budget, or cite the v0.1 M3 probe data).
+
+**Run loop:**
+
+```python
+import json
+from pathlib import Path
+import ast
+
+RUNS_PER_PROBE = 6
+results = []
+for probe in probes:
+    for run_idx in range(RUNS_PER_PROBE):
+        body = generate_body(probe)            # uses M15 tool-use harness
+        truncated = not _looks_complete(body)
+        try:
+            ast.parse(body)
+            parses = True
+        except SyntaxError:
+            parses = False
+        matches = _matches_reference(body, probe.reference)
+        results.append({
+            "probe_id": probe.id,
+            "run": run_idx,
+            "generated_body": body,
+            "parses_as_python": parses,
+            "matches_reference": matches,
+            "truncated": truncated,
+        })
+
+(Path(__file__).parent / "results.json").write_text(
+    json.dumps({"runs": results}, indent=2))
+```
+
+**Stability scoring:** a probe is "stable+correct" if at least 5 of 6
+runs are parses_as_python and at least 4 of 6 match the reference (or
+parse equivalently — `_matches_reference` may use AST-equivalence rather
+than byte-equal for non-trivial bodies). The harness emits a
+per-probe verdict at the end.
+
+The executor does NOT make the gate verdict — that is M17.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/probes.json /tmp/probes.json.m16.bak && cp /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/harness_fast.py /tmp/harness_fast.py.m16.bak`
+   FAIL: HARD
+2. Read /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/probes.json.
+3. Read /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/GATE.md and log.md (or whichever file documents what was wrong with P1 and P2).
+
+**Phase 1 — Write**
+
+4. Edit /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/probes.json — apply the P1 description and P2 reference corrections.
+   FAIL: HARD
+5. Edit harness_fast.py to support the run-loop (RUNS_PER_PROBE=6) if
+   not already; ensure results.json is written to v0.3 probe dir.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+6. RUN: `python /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/harness_fast.py`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+7. RUN: `python -c "import json; r = json.load(open('/project/local/sprints/tooling-v0.3/probes/m14-bidirectional/results.json')); print(len(r['runs']))"`
+   EXPECT MATCHES: ^30$
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+8. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified.
+- Per-probe pass rate (parses_as_python and matches_reference counts
+  out of 6 runs).
+- Total API spend.
+- The corrections applied to P1 and P2 (verbatim).
+- Step results table.
+- Anomalies.
+- Rollback.
+      ]]></report>
+    </mission>
+
+    <mission n="17" tier="reason" review="false">
+      <context><![CDATA[
+M16 produced 30 probe records at /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/results.json.
+M17 evaluates them against the gate criteria and issues a verdict.
+
+DP1 / design Decision 1 criteria:
+  - 4/5 probes stable+correct → UNLOCK Phase 5 (M18, M19 run).
+  - 3/5 → AMBIGUOUS, commander decides externally (sprint pauses).
+  - <3 → DEFER, sprint closes at Phase 4.
+
+"Stable+correct" definition (from M16 spec): >= 5/6 parses_as_python
+AND >= 4/6 matches_reference (AST-equivalent or byte-equal).
+
+The verdict is written to /project/local/sprints/tooling-v0.3/gate.xml.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Read results.json and per-probe statistics.
+2. Apply the stable+correct definition to each probe; aggregate to a
+   total stable+correct count.
+3. Issue verdict UNLOCK / AMBIGUOUS / DEFER per DP1.
+4. Write /project/local/sprints/tooling-v0.3/gate.xml with verdict and
+   per-probe results.
+5. If verdict is DEFER, document the disposition: which probes failed
+   and why (truncation? parse fail? reference mismatch?).
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/local/sprints/tooling-v0.3/gate.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<gate sprint="tooling-v0.3" mission="17" generated="<ISO-8601 timestamp>">
+  <verdict>UNLOCK | AMBIGUOUS | DEFER</verdict>
+  <criteria>
+    <stable_correct_threshold>5</stable_correct_threshold>
+    <probe_count>5</probe_count>
+    <stable_correct_count>N</stable_correct_count>
+    <unlock_threshold>4</unlock_threshold>
+    <ambiguous_threshold>3</ambiguous_threshold>
+    <stable_correct_definition>
+      A probe is stable+correct if &gt;= 5/6 runs parse as Python AND
+      &gt;= 4/6 runs match the reference (AST-equivalent or byte-equal).
+    </stable_correct_definition>
+  </criteria>
+  <probes>
+    <probe id="P1">
+      <parses>5</parses>
+      <matches>4</matches>
+      <truncated>0</truncated>
+      <stable_correct>true</stable_correct>
+      <notes>...</notes>
+    </probe>
+    <!-- P2..P5 -->
+  </probes>
+  <decision>
+    <rationale>
+      <!-- Reason-tier judgement: which probes drove the verdict, any
+           edge cases (e.g. 5/6 parse but 3/6 match — does it count?). -->
+    </rationale>
+    <next_action>
+      <!-- "Phase 5 dispatches M18 then M19." | "Sprint pauses for
+           commander decision." | "Sprint closes at Phase 4." -->
+    </next_action>
+  </decision>
+</gate>
+```
+
+**Reason-tier judgement to document:**
+
+Edge cases:
+  - A probe at 5/6 parse + 3/6 match: not stable+correct by the strict
+    definition. Note in the report whether this is the right cut.
+  - All probes pass parse but no probe passes match: this means the
+    envelope is fixed but the geometry is not yet capturing semantic
+    correctness — DEFER with a note that bidirectional MLD needs more
+    work even though M15's truncation fix worked.
+  - Truncation rate > 0 on any probe: surfaces in the report as
+    "truncation regression" and should bias the verdict toward
+    AMBIGUOUS even at high pass rates.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `test -f /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/results.json && echo RESULTS_EXIST || echo MISSING`
+   EXPECT CONTAINS: RESULTS_EXIST
+   FAIL: HARD
+2. Read /project/local/sprints/tooling-v0.3/probes/m14-bidirectional/results.json.
+
+**Phase 1 — Write**
+
+3. Apply the stable+correct definition to each probe.
+4. Determine the verdict.
+5. Write /project/local/sprints/tooling-v0.3/gate.xml.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+6. RUN: `python -c "import xml.etree.ElementTree as ET; t = ET.parse('/project/local/sprints/tooling-v0.3/gate.xml'); v = t.find('verdict').text; assert v in ('UNLOCK','AMBIGUOUS','DEFER'); print(v)"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+7. RUN: `python -c "import xml.etree.ElementTree as ET; t = ET.parse('/project/local/sprints/tooling-v0.3/gate.xml'); print(len(t.findall('.//probe')))"`
+   EXPECT MATCHES: ^5$
+   FAIL: HARD
+
+**Phase 4 — Report**
+
+8. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files written: /project/local/sprints/tooling-v0.3/gate.xml.
+- The verdict (UNLOCK / AMBIGUOUS / DEFER).
+- Per-probe statistics summary.
+- The reasoning for the verdict, especially edge cases and any probe
+  that was borderline.
+- Whether Phase 5 dispatches.
+- Step results table.
+      ]]></report>
+    </mission>
+
+    <mission n="18" tier="execute" review="true">
+      <context><![CDATA[
+**Conditional on M17 verdict = UNLOCK.** If M17 returned AMBIGUOUS or
+DEFER, this mission and M19 do not run; the sprint closes at Phase 4.
+
+Every MLD run produces labelled training data for free:
+  - Converged winner per function = SFT-positive.
+  - Non-winning candidates = SFT-negative (or, if we want preference
+    data: ranked by centroid distance for DPO).
+  - Every gate call → (description, valid|invalid, reason) triple.
+
+Indexing 4 SDKs at n=10 candidates per function = 20-30K SFT examples.
+Endgame: fine-tune nano on this data; the fine-tuned model replaces
+converge.xml entirely.
+
+M18 wires the data emission. Storage: append-only JSONL at
+.pidgin/training-data.jsonl. Schema below.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Define the JSONL schema for SFT and gate-SFT entries.
+2. Add a writer to /project/pidgin/store/nest.py (or a new
+   pidgin/store/sft.py — executor decides per existing layout).
+3. Hook into the MLD pipeline: after each function converges, emit one
+   SFT-positive (winner) + one SFT-negative (a candidate furthest from
+   centroid) entry.
+4. Hook into the gate path: each gate decision emits one gate-SFT entry.
+5. Print example count after every index run: "Wrote N training
+   examples to .pidgin/training-data.jsonl (cumulative: T)."
+      ]]></objective>
+
+      <specification><![CDATA[
+**File:** `/project/pidgin/store/sft.py` (new)
+
+```python
+"""SFT / DPO / gate-SFT data emitter. Append-only JSONL."""
+
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict
+
+SFT_FILENAME = "training-data.jsonl"
+
+@dataclass
+class SFTRecord:
+    """Schema (versioned).
+    type='sft':  {prompt, completion, label='positive|negative'}
+    type='gate': {prompt, label='valid|invalid', reason}
+    """
+    version: int = 1
+    type: str = "sft"           # "sft" | "gate"
+    timestamp: str = ""         # ISO-8601 UTC
+    prompt: str = ""
+    completion: str = ""        # for sft only
+    label: str = ""             # "positive"/"negative" or "valid"/"invalid"
+    reason: str = ""            # for gate only
+    function_id: str = ""       # provenance: which indexed function
+    centroid_distance: float | None = None  # for sft-negative
+
+def append(repo_root: str, records: list[SFTRecord]) -> str:
+    out = Path(repo_root) / ".pidgin" / SFT_FILENAME
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a") as f:
+        for r in records:
+            r.timestamp = r.timestamp or datetime.now(timezone.utc).isoformat()
+            f.write(json.dumps(asdict(r)))
+            f.write("\n")
+    return str(out)
+
+def count(repo_root: str) -> int:
+    p = Path(repo_root) / ".pidgin" / SFT_FILENAME
+    if not p.exists():
+        return 0
+    return sum(1 for _ in p.open("r"))
+```
+
+**File:** `/project/pidgin/verbs/index.py`
+
+After MLD completes, before the file-summary step:
+
+```python
+from pidgin.store import sft
+
+records: list[sft.SFTRecord] = []
+for r in results:
+    if r.error or not r.winner:
+        continue
+    # SFT positive: prompt = MLD-prompt-for-this-function, completion = winner.description.
+    records.append(sft.SFTRecord(
+        type="sft",
+        prompt=r.prompt_used,        # see Anomaly note
+        completion=r.winner.description,
+        label="positive",
+        function_id=r.function_id,
+    ))
+    # SFT negative: candidate furthest from centroid.
+    if r.candidates and r.centroid is not None:
+        worst = max(r.candidates, key=lambda c: 1 - cosine_similarity(c.embedding, r.centroid))
+        records.append(sft.SFTRecord(
+            type="sft",
+            prompt=r.prompt_used,
+            completion=worst.description,
+            label="negative",
+            function_id=r.function_id,
+            centroid_distance=1 - cosine_similarity(worst.embedding, r.centroid),
+        ))
+
+n_new = len(records)
+sft.append(repo_root, records)
+total = sft.count(repo_root)
+print(f"[index] Wrote {n_new} training examples to "
+      f".pidgin/training-data.jsonl (cumulative: {total}).")
+```
+
+**Anomaly note:** `r.prompt_used` may not exist on FunctionMldResult.
+The executor confirms in Phase 0; if absent, extends FunctionMldResult
+with `prompt_used: str = ""` and populates it at generation time.
+
+**Gate hook:** wherever gate calls are made (likely
+/project/pidgin/pipeline/mld.py or batch.py), after the gate result is
+obtained, append a gate-SFT record with `type="gate"`,
+`prompt=description_being_validated`, `label="valid"|"invalid"`,
+`reason=gate_response.reason`.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /project/pidgin/verbs/index.py /tmp/index.py.m18.bak && cp /project/pidgin/store/nest.py /tmp/nest.py.m18.bak`
+   FAIL: HARD
+2. RUN: `cp /project/pidgin/pipeline/batch.py /tmp/batch.py.m18.bak && cp /project/pidgin/pipeline/mld.py /tmp/mld.py.m18.bak`
+   FAIL: HARD
+3. Read /project/pidgin/pipeline/batch.py and mld.py to find the gate
+   call site and confirm FunctionMldResult fields (winner, candidates,
+   centroid, prompt_used).
+
+**Phase 1 — Write**
+
+4. Write /project/pidgin/store/sft.py per spec.
+   FAIL: HARD
+5. If FunctionMldResult is missing prompt_used, extend the dataclass
+   and populate at generation time.
+   FAIL: HARD
+6. Edit /project/pidgin/verbs/index.py to emit SFT records per spec
+   and print the cumulative count.
+   FAIL: HARD
+7. Edit the gate call site to emit gate-SFT records.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+8. RUN: `python -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/project/pidgin/**/*.py', recursive=True)]"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+9. RUN: `python -c "from pidgin.store.sft import SFTRecord, append, count, SFT_FILENAME; print('IMPORT_OK')"`
+   EXPECT CONTAINS: IMPORT_OK
+   FAIL: HARD
+10. RUN: `bash -c 'rm -rf /tmp/m18-test && mkdir /tmp/m18-test && python -c "from pidgin.store.sft import SFTRecord, append, count; append(\"/tmp/m18-test\", [SFTRecord(type=\"sft\", prompt=\"p\", completion=\"c\", label=\"positive\")]); print(count(\"/tmp/m18-test\"))"'`
+    EXPECT MATCHES: ^1$
+    FAIL: HARD
+
+**Phase 4 — Report**
+
+11. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files written, files modified.
+- The exact SFT and gate-SFT schema (paste as written).
+- Whether prompt_used was added to FunctionMldResult.
+- The gate call site location (line numbers).
+- Step results table.
+- Anomalies (e.g. multiple gate paths; cumulative count drift).
+- Rollback (4-file restore).
+      ]]></report>
+    </mission>
+
+    <mission n="19" tier="execute" review="false">
+      <context><![CDATA[
+**Conditional on M17 verdict = UNLOCK.** Closes the cleanup-debt list
+collected through v0.2 and during v0.3 implementation. All tasks are
+mechanical and independent.
+
+Cleanup items (from design.md and v3-founding-record.md):
+  1. Remove 4 `from tools.` import hits in /project/pidgin/pipeline/.
+  2. Make /project/tools/ a thin re-export shim or delete entirely.
+  3. Fix compress_write commit message prefix.
+  4. Bump Anthropic gate max_tokens 256 → 512.
+  5. Fix type annotation inconsistencies (tuple-as-list-default,
+     `config: ExpansionConfig = None`).
+  6. Add .pidgin/ to repo .gitignore template.
+  7. Remove the duplicate example from converge.xml (ex5 and
+     ex_rust_simple are the same clamp function).
+  8. Remove the M3 alias `_find_project_root = find_project_root` from
+     pidgin/write/new.py if no internal callers remain (check via grep).
+  9. Remove the M10 imports.minimal.json writer and any dependency on
+     it; depends.py now reads imports.json (M12).
+      ]]></context>
+
+      <objective><![CDATA[
+1. Land all 9 cleanup items.
+2. Verify each via grep / structural check.
+3. Report exactly what changed for each.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Item 1+2: tools/ imports.**
+
+Current hits (per stress-test-findings):
+  - /project/pidgin/pipeline/batch.py:700  `from tools.utils.api import generate`
+  - /project/pidgin/pipeline/batch.py:778  `from tools.utils.api import embed_for_store`
+  - /project/pidgin/pipeline/mld.py:26     `from tools.utils import api`
+  - /project/pidgin/pipeline/mld.py:27     `from tools.utils.api import CostSummary, GenerateResult`
+
+Action: replace each with the equivalent pidgin.* import. The shapes
+(`generate`, `embed_for_store`, `api`, `CostSummary`, `GenerateResult`)
+should already exist in `/project/pidgin/utils/api.py`; if any do not,
+copy them across (with a provenance comment) and remove from tools/.
+
+After all four are removed, attempt to delete /project/tools/utils/api.py
+or shrink tools/ to a thin re-export shim. The executor decides based on
+what tools/ still contains; if any other files reference tools/, leave a
+shim. Document.
+
+**Item 3: compress_write commit message.**
+
+Find the commit-message construction in /project/pidgin/write/compress.py.
+The current prefix is likely "compress_write:"; should be
+"pidgin/compress_write:". Apply the change.
+
+**Item 4: Anthropic gate max_tokens.**
+
+In whichever file declares the Anthropic gate call, change `max_tokens=256`
+to `max_tokens=512`.
+
+**Item 5: type annotations.**
+
+Common offenders:
+  - `tuple-as-list-default`: `def f(x: list = ())`. Fix to a sensible
+    default (sentinel `None`, then `x = x or []`) or correct type.
+  - `config: ExpansionConfig = None`: should be
+    `config: ExpansionConfig | None = None`.
+
+Grep for these patterns; fix every occurrence.
+
+**Item 6: .gitignore.**
+
+If /project/.gitignore exists, append `.pidgin/` if not already present.
+If not, create one with `.pidgin/` and `__pycache__/`. Do NOT touch
+.gitignore files inside other repos that may be cloned under /project.
+
+**Item 7: converge.xml duplicate.**
+
+Read /project/pidgin/prompts/converge.xml. Find the two examples for the
+clamp function (ex5 and ex_rust_simple). Remove one (executor's choice;
+prefer keeping the one with the better convergence example).
+
+**Item 8: alias removal.**
+
+```bash
+grep -rn "_find_project_root" /project/pidgin/
+```
+If only the alias line and its definition remain, drop the alias line.
+If any other internal callers reference _find_project_root, update them
+to find_project_root and then drop the alias.
+
+**Item 9: imports.minimal.json removal.**
+
+  - Remove the writer (_save_graph in M10's depends.py and the
+    MINIMAL_IMPORTS_FILENAME constant) once depends.py prefers
+    imports.json (M12).
+  - Document any callers that read imports.minimal.json.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `bash -c 'cd /project && tar czf /tmp/m19.bak.tgz pidgin tools .gitignore 2>/dev/null || echo NO_GITIGNORE'`
+   FAIL: HARD
+2. RUN: `grep -rn "from tools\." /project/pidgin/`
+   FAIL: SOFT
+3. RUN: `grep -rn "_find_project_root" /project/pidgin/`
+   FAIL: SOFT
+
+**Phase 1 — Write**
+
+4. Edit /project/pidgin/pipeline/batch.py and /project/pidgin/pipeline/mld.py
+   to replace `from tools.` imports with `from pidgin.` equivalents.
+   FAIL: HARD
+5. Audit /project/tools/ — delete or shrink to a shim. If kept, the shim
+   must contain only re-export lines; document.
+   FAIL: HARD
+6. Edit /project/pidgin/write/compress.py — fix commit-message prefix
+   to "pidgin/compress_write:".
+   FAIL: HARD
+7. Edit the Anthropic gate call site — max_tokens 256 → 512.
+   FAIL: HARD
+8. Audit and fix type annotations across pidgin/.
+   FAIL: HARD
+9. Add .pidgin/ to /project/.gitignore (create the file if missing).
+   FAIL: HARD
+10. Edit /project/pidgin/prompts/converge.xml to remove the duplicate
+    clamp example.
+    FAIL: HARD
+11. Remove the M3 _find_project_root alias from pidgin/write/new.py if
+    no callers remain.
+    FAIL: HARD
+12. Remove the imports.minimal.json writer from depends.py.
+    FAIL: HARD
+
+**Phase 2 — Verify**
+
+13. RUN: `grep -rn "from tools\." /project/pidgin/ --include='*.py'`
+    EXPECT EXIT CODE: 1
+    FAIL: HARD
+14. RUN: `grep -rn "max_tokens=256" /project/pidgin/`
+    EXPECT EXIT CODE: 1
+    FAIL: HARD
+15. RUN: `grep -n ".pidgin" /project/.gitignore`
+    EXPECT CONTAINS: .pidgin
+    FAIL: HARD
+16. RUN: `python -c "import xml.etree.ElementTree as ET; ET.parse('/project/pidgin/prompts/converge.xml')"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+17. RUN: `grep -c "ex5\|ex_rust_simple" /project/pidgin/prompts/converge.xml`
+    EXPECT MATCHES: ^[01]$
+    FAIL: HARD
+18. RUN: `python -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/project/pidgin/**/*.py', recursive=True)]"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+19. RUN: `grep -rn "imports.minimal.json\|MINIMAL_IMPORTS_FILENAME" /project/pidgin/`
+    EXPECT EXIT CODE: 1
+    FAIL: HARD
+
+**Phase 4 — Report**
+
+20. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Per-item summary (1-9): what changed, file paths, line numbers.
+- Whether tools/ was deleted or shrunk to a shim (with rationale).
+- The list of type-annotation fixes applied.
+- The before/after of .gitignore.
+- Step results table.
+- Anomalies (esp. unreachable cleanup items, e.g. an item where no
+  occurrence existed in the codebase).
+- Rollback: `tar xzf /tmp/m19.bak.tgz -C /project`.
+      ]]></report>
+    </mission>
+
+  </missions>
+</sprint>

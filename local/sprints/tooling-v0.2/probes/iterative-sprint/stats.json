@@ -1,0 +1,211 @@
+[
+  {
+    "mission": 1,
+    "valid": 6,
+    "total": 10,
+    "avg_sim": 0.9547,
+    "centroid_dist": 0.1603,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0427,
+    "elapsed_s": 279.7
+  },
+  {
+    "mission": 2,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9654,
+    "centroid_dist": 0.15,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0383,
+    "elapsed_s": 188.3
+  },
+  {
+    "mission": 3,
+    "valid": 9,
+    "total": 10,
+    "avg_sim": 0.9673,
+    "centroid_dist": 0.143,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0435,
+    "elapsed_s": 248.6
+  },
+  {
+    "mission": 4,
+    "valid": 6,
+    "total": 10,
+    "avg_sim": 0.9575,
+    "centroid_dist": 0.1556,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0477,
+    "elapsed_s": 127.3
+  },
+  {
+    "mission": 5,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9696,
+    "centroid_dist": 0.1456,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0424,
+    "elapsed_s": 157.2
+  },
+  {
+    "mission": 6,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9564,
+    "centroid_dist": 0.1763,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0494,
+    "elapsed_s": 219.4
+  },
+  {
+    "mission": 7,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9656,
+    "centroid_dist": 0.1527,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0582,
+    "elapsed_s": 97.3
+  },
+  {
+    "mission": 8,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9733,
+    "centroid_dist": 0.1286,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0481,
+    "elapsed_s": 157.7
+  },
+  {
+    "mission": 9,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9693,
+    "centroid_dist": 0.1346,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0595,
+    "elapsed_s": 308.3
+  },
+  {
+    "mission": 10,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9608,
+    "centroid_dist": 0.1446,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0686,
+    "elapsed_s": 308.1
+  },
+  {
+    "mission": 11,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.97,
+    "centroid_dist": 0.1413,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0596,
+    "elapsed_s": 489.6
+  },
+  {
+    "mission": 12,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9632,
+    "centroid_dist": 0.1498,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.062,
+    "elapsed_s": 218.2
+  },
+  {
+    "mission": 13,
+    "valid": 9,
+    "total": 10,
+    "avg_sim": 0.9617,
+    "centroid_dist": 0.156,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0735,
+    "elapsed_s": 218.3
+  },
+  {
+    "mission": 14,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9492,
+    "centroid_dist": 0.1578,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0708,
+    "elapsed_s": 127.6
+  },
+  {
+    "mission": 15,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9629,
+    "centroid_dist": 0.1629,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0791,
+    "elapsed_s": 157.7
+  },
+  {
+    "mission": 16,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9614,
+    "centroid_dist": 0.1372,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0743,
+    "elapsed_s": 97.6
+  },
+  {
+    "mission": 17,
+    "valid": 7,
+    "total": 10,
+    "avg_sim": 0.9624,
+    "centroid_dist": 0.1415,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0667,
+    "elapsed_s": 127.5
+  },
+  {
+    "mission": 18,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9661,
+    "centroid_dist": 0.1419,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0769,
+    "elapsed_s": 157.5
+  },
+  {
+    "mission": 19,
+    "valid": 10,
+    "total": 10,
+    "avg_sim": 0.9617,
+    "centroid_dist": 0.1574,
+    "risks_count": 0,
+    "selected": true,
+    "cost": 0.0838,
+    "elapsed_s": 97.3
+  }
+]

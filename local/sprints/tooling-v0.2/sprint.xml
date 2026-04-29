@@ -1,0 +1,5039 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sprint Plan: tooling-v0.2
+  Authored by /new-sprint against design.md and context/ on 2026-04-26.
+  Conforms to rf-edge/marionette/mission-grammar.md.
+  Synthesis basis: sprint-comparison-judgment.md (Plan B spec density +
+  Plan A upfront pidgin/ layout + corrected tier attribution).
+-->
+<sprint name="tooling-v0.2" version="1">
+  <summary>
+    Package the validated v0.1 MLD engine as Pidgin: write model with four
+    modes, XML prompt migration, OpenAI/Anthropic batch dispatch, adaptive
+    candidates, CLI with four verbs, nest convention, nested nest discovery,
+    and an empirical gate for bidirectional MLD that conditionally unlocks
+    sprint-plan-as-artifact. 19 missions across 5 phases. Phase 5 (M17-M19)
+    only runs if the Phase 4 gate clears. Expected duration: 1-2 sprint days.
+    Total API spend target: under $2.00.
+  </summary>
+
+  <decision_points>
+    <dp id="1" default="adopt-from-M1">
+      Adopt the /project/pidgin/ package layout from M1 onward (so M10
+      becomes a reconciliation/audit step, not a relocation), or write to
+      flat /project/write/, /project/pipeline/, /project/prompts/ first
+      and move in M10? Default matches design Decision 2 ("extraction, not
+      rewrite") interpreted as final-location-from-the-start — every new
+      file lands in pidgin/ with a provenance comment pointing at its
+      v0.1 source.
+    </dp>
+    <dp id="2" default="defer-to-v0.3">
+      If the Phase 4 gate (M16) returns fewer than 3/5 stable converged
+      probes, skip Phase 5 (M17-M19) entirely and close the sprint with
+      a documented disposition. Default per design Decision 1.
+    </dp>
+    <dp id="3" default="prep-only">
+      Open-source prep scope inside v0.2: include MIT license header in
+      pidgin/__init__.py and a README.md scaffold in pidgin/, but do NOT
+      publish to PyPI, do NOT register a namespace, do NOT push public.
+      Default per design Decision 5.
+    </dp>
+    <dp id="4" default="10">
+      Batch auto-threshold (synchronous below, batch at-or-above). Design
+      Decision 4 / batch-dispatch.md: 10. Configurable; subject to
+      empirical tuning post-sprint.
+    </dp>
+    <dp id="5" default="text-embedding-3-small@256">
+      Embedding model and dimension for both ephemeral MLD geometry and
+      stored nest vectors. Design Decision 6 fixes this — no operator
+      input expected; flagged for audit only.
+    </dp>
+  </decision_points>
+
+  <missions>
+
+    <mission n="1" tier="execute" review="true">
+      <context><![CDATA[
+v0.1 routed all writes through `crispr_write` / `crispr_edit` in
+`tools/store/audit.py`. M14 (Origami reprocessing) exposed the failure
+mode: 660 lines of Python to build a markdown file, a `_seed_new_file`
+workaround for new files (CRISPR pre-write `git add` fails on
+non-existent paths producing 3 commits per new file), and per-operation
+git brackets. The write-model context document specifies four modes;
+Modes 3 (New) and 4 (Compress) share write semantics: no hash
+verification, no pre-write commit, one git commit per BATCH, one audit
+entry per batch. This mission implements `artifact_write` and ships it
+in pidgin/write/new.py and pidgin/write/compress.py.
+
+Decision 2 in the design fixes the package layout from M1: every new
+file lands at /project/pidgin/<subpackage>/ with a provenance comment
+naming its v0.1 source. M10 will reconcile (audit imports, validate
+all v0.1 references resolved), not relocate.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement `artifact_write` shared by Modes 3 and 4.
+2. Ship pidgin/write/new.py (Mode 3 wrapper) and pidgin/write/compress.py
+   (Mode 4 wrapper that records `input_source_hash` for lineage).
+3. Produce one git commit per batch and one JSONL audit entry listing
+   all files in the batch.
+4. Add provenance comments pointing at tools/store/audit.py.
+5. Write a self-test that creates three files in one batch and verifies
+   exactly one commit and one audit record were produced.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Files to create:**
+
+- /project/pidgin/__init__.py — package marker, version "0.2.0", MIT
+  license header (DP3), top-level re-exports added incrementally.
+- /project/pidgin/write/__init__.py — re-exports `artifact_write`,
+  `compress_write`, and (later, M2) `update`.
+- /project/pidgin/write/new.py
+- /project/pidgin/write/compress.py
+- /project/pidgin/utils/__init__.py — empty marker.
+- /project/pidgin/utils/git.py — git bracket helpers (extracted from
+  tools/store/audit.py). Provenance: tools/store/audit.py.
+
+**Shared dataclass (defined in pidgin/write/new.py, imported by
+compress.py):**
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class ArtifactWriteResult:
+    files_written: list[str]      # absolute paths
+    commit_sha: str               # post-write commit SHA, "" if no git
+    audit_id: str                 # audit-entry uuid (one per batch)
+    bytes_total: int
+```
+
+**Function signature (Mode 3 — pidgin/write/new.py):**
+
+```python
+def artifact_write(
+    files: list[tuple[str, str]],          # [(absolute_path, content), ...]
+    audit_metadata: dict,                  # caller-supplied tags (mission, verb, etc.)
+    *,
+    commit_message: str | None = None,     # default: derived from audit_metadata
+    skip_git: bool = False,                # for tests; default False
+) -> ArtifactWriteResult: ...
+```
+
+Behaviour:
+- For each (path, content): mkdir -p the parent, write atomically
+  (write to `<path>.tmp` then os.replace), preserve content bytes
+  exactly (no normalisation).
+- After ALL files are written, run a SINGLE `git add -- <p1> <p2> ...`
+  + `git commit -m <msg>` in /project. Capture the resulting SHA.
+- Append ONE JSONL line to /project/.pidgin/audit/artifact_write.jsonl
+  with: timestamp (ISO8601 UTC), audit_id (uuid4 hex), mode ("new"),
+  files (list of {path, sha256, bytes}), commit_sha, audit_metadata.
+- If `skip_git=True`: do not commit, do not require a git repo;
+  ArtifactWriteResult.commit_sha = "".
+
+**Function signature (Mode 4 — pidgin/write/compress.py):**
+
+```python
+def compress_write(
+    inputs: list[tuple[str, str, str]],    # [(input_path, output_path, output_content), ...]
+    audit_metadata: dict,
+    *,
+    commit_message: str | None = None,
+    skip_git: bool = False,
+) -> ArtifactWriteResult: ...
+```
+
+Behaviour:
+- Identical write/commit semantics to artifact_write.
+- For each input_path: read it, sha256 it, store the digest as
+  `input_source_hash` in the audit entry alongside the output entry.
+  Audit JSONL: mode="compress", lineage=[{input_path, input_source_hash,
+  output_path, output_sha256, output_bytes}, ...].
+- If input_path does not exist or is not readable: HARD failure.
+  No silent skip.
+
+**git.py helpers (provenance: tools/store/audit.py):**
+
+```python
+def git_commit_files(
+    project_root: str,
+    paths: list[str],
+    message: str,
+) -> str:  # returns commit SHA
+    ...
+
+def is_git_repo(project_root: str) -> bool: ...
+```
+
+Implement using subprocess with check=True. project_root is
+/project. Reject paths not under project_root.
+
+**Audit directory bootstrap:**
+
+If /project/.pidgin/audit/ does not exist, create it on first write.
+Do not create /project/.pidgin/nest/ here — that is M12.
+
+**Provenance comment convention** (Decision 2):
+
+Every file authored by extraction has a top-of-file comment block:
+
+```python
+# pidgin v0.2 — extracted from tools/store/audit.py (v0.1)
+# Provenance: function `crispr_write` (legacy Mode-2 only). This module
+# implements Modes 3 (artifact_write) and 4 (compress_write) which were
+# missing in v0.1.
+```
+
+This is the first such file. Set the convention.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m1 && cp -r /project/tools/store /tmp/m1/store_backup 2>/dev/null || true`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. Read /project/tools/store/audit.py using read_file. Note the
+existing `crispr_write` git-bracket pattern, the
+`_seed_new_file` workaround, and the JSONL audit format. Match the
+JSONL field names where reasonable.
+FAIL: SOFT
+
+Step 3. RUN: `test -d /project/pidgin && echo EXISTS || echo MISSING`
+EXPECT CONTAINS: MISSING
+FAIL: SOFT  (if pidgin/ already exists from a prior run, M10
+              reconciliation will catch overlap)
+
+**Phase 1 — Write**
+
+Step 4. Write /project/pidgin/__init__.py per the MIT-header spec.
+FAIL: HARD
+
+Step 5. Write /project/pidgin/utils/__init__.py (empty marker file with
+a single-line provenance comment).
+FAIL: HARD
+
+Step 6. Write /project/pidgin/utils/git.py with `git_commit_files` and
+`is_git_repo` per the specification.
+FAIL: HARD
+
+Step 7. Write /project/pidgin/write/__init__.py exporting
+`artifact_write`, `compress_write`, `ArtifactWriteResult`.
+FAIL: HARD
+
+Step 8. Write /project/pidgin/write/new.py with `ArtifactWriteResult`
+dataclass and `artifact_write` function per the specification.
+FAIL: HARD
+
+Step 9. Write /project/pidgin/write/compress.py with `compress_write`
+per the specification, importing `ArtifactWriteResult` from new.py.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 10. RUN: `python -c "from pidgin.write import artifact_write, compress_write, ArtifactWriteResult; print('ok')"`
+(working dir /project)
+EXPECT CONTAINS: ok
+FAIL: HARD
+
+Step 11. Write /tmp/m1/test_artifact_write.py:
+
+```python
+import os, json, subprocess, tempfile, sys
+sys.path.insert(0, "/project")
+from pidgin.write import artifact_write
+
+# Self-test in a throwaway git repo so we don't pollute /project history.
+with tempfile.TemporaryDirectory() as d:
+    subprocess.check_call(["git", "init", "-q"], cwd=d)
+    subprocess.check_call(["git", "config", "user.email", "test@local"], cwd=d)
+    subprocess.check_call(["git", "config", "user.name", "test"], cwd=d)
+    files = [(os.path.join(d, f"f{i}.txt"), f"content-{i}") for i in range(3)]
+    # Monkey: artifact_write expects /project root. Patch via env or arg.
+    # The reference implementation reads project_root from the first path's
+    # common ancestor up to the .git boundary; if it doesn't, fall back to
+    # passing project_root as a kwarg (executor: adapt and document).
+    res = artifact_write(files, {"mission": "M1-selftest"})
+    assert len(res.files_written) == 3, res
+    log = subprocess.check_output(["git", "log", "--oneline"], cwd=d).decode()
+    assert log.count("\n") == 1, f"expected one commit, got: {log!r}"
+    audit = open(os.path.join(d, ".pidgin/audit/artifact_write.jsonl")).read().strip().split("\n")
+    assert len(audit) == 1, f"expected one audit entry, got {len(audit)}"
+    entry = json.loads(audit[0])
+    assert len(entry["files"]) == 3
+    print("PASS")
+```
+
+FAIL: HARD
+
+Step 12. RUN: `python /tmp/m1/test_artifact_write.py`
+EXPECT CONTAINS: PASS
+FAIL: HARD  (if fails: executor MAY adapt artifact_write to accept
+             a `project_root` kwarg — document the deviation in the report)
+
+Step 13. RUN: `wc -l /project/pidgin/write/new.py /project/pidgin/write/compress.py /project/pidgin/utils/git.py`
+EXPECT MATCHES: ^[[:space:]]*[0-9]+
+FAIL: SOFT  (size sanity only)
+
+**Phase 3 — Documentation**
+
+Step 14. Write /project/pidgin/write/CLAUDE.md — discovery index
+listing the three modes (New, Compress, plus stub for Update/M2),
+function signatures, and the provenance line for each file.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 15. Produce the structured report per the <report> block.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 1 Report
+
+**Status:** GREEN | RED
+**Files written:** list with line counts
+**Files modified:** none expected (new package)
+
+### Step Results
+Table per the mission-grammar template.
+
+### Self-Test Output
+Paste the exact stdout of `python /tmp/m1/test_artifact_write.py`.
+
+### Key Observations
+- Was a `project_root` kwarg added? If yes, why and what signature?
+- Audit JSONL format chosen (paste one entry).
+- Any deviation from tools/store/audit.py conventions worth flagging
+  for downstream missions.
+
+### Anomalies
+- API differences between spec and what was actually feasible.
+- Hash-derivation choice (sha256? blake2?) — note for Mode 2 alignment.
+
+### Risks
+- (HIGH) artifact_write is now the only path for Mode 3/4 writes;
+  any silent failure in the JSONL append loses lineage.
+- (MED) Atomic write via os.replace assumes same-filesystem temp;
+  cross-mount paths will EXDEV.
+- (LOW) MIT header convention may need tweaking when pidgin/__init__.py
+  is touched again in M11 (CLI entry).
+
+### Rollback
+`rm -rf /project/pidgin && cp -r /tmp/m1/store_backup /project/tools/store`
+(only the `rm -rf /project/pidgin` half is needed if the backup copy
+was a no-op; document which.)
+      ]]></report>
+    </mission>
+
+    <mission n="2" tier="execute" review="true">
+      <context><![CDATA[
+v0.1 had `crispr_write` / `crispr_edit` apply each operation under its
+own git bracket. Comment stripping on a single file produced 20-40
+commits. The write-model context document specifies the fix: Mode 2
+(Update) accumulates operations in memory and commits once per FILE,
+not once per OPERATION. The transaction context manager pattern:
+
+```python
+with pidgin.update("parser.py") as f:
+    f.strip_comment(line=5)
+    f.insert_tag(line=5, tag="mld:extract_ast", content=desc)
+    f.replace(line_start=10, line_end=12, content=new_block)
+# exit: writes file once, one pre-write commit, one post-write commit,
+# one audit entry listing all 3 operations.
+```
+
+This mission ports `crispr_write` / `crispr_edit` from tools/store/audit.py
+into pidgin/write/update.py wrapped in the transaction context. The
+hash-verification semantics carry over — Mode 2 is the only mode that
+verifies. M1's `artifact_write` handled Mode 3/4. After this mission,
+M3 onward can treat the write layer as complete.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement the `Transaction` context manager that batches
+   operations, applies them atomically, and brackets the file with
+   pre/post git commits.
+2. Ship pidgin/write/update.py exposing `update(path) -> Transaction`
+   and the operation methods `replace`, `insert_tag`, `strip_comment`,
+   plus a generic `replace_lines`.
+3. Verify hash semantics: pre_hash captured before any write,
+   post_hash captured after the single atomic write, both recorded
+   in the audit entry.
+4. Self-test: queue 5 edits on one file, verify exactly 2 commits
+   (pre + post) and 1 audit entry listing all 5 operations.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to create:**
+
+- /project/pidgin/write/update.py
+  Provenance: tools/store/audit.py — functions `crispr_write`,
+  `crispr_edit`, hash-verification helpers.
+
+**Edit operation dataclass:**
+
+```python
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass(frozen=True)
+class EditOp:
+    kind: Literal["replace", "insert_tag", "strip_comment", "replace_lines"]
+    line_start: int                # 1-indexed inclusive
+    line_end: int                  # 1-indexed inclusive; == line_start for single-line ops
+    payload: str                   # new content; empty string means deletion
+    metadata: dict                 # e.g. {"tag": "mld:extract_ast"} for insert_tag
+```
+
+**Transaction class:**
+
+```python
+class Transaction:
+    def __init__(self, path: str, *, project_root: str = "/project"): ...
+
+    # Context manager
+    def __enter__(self) -> "Transaction": ...
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # On exception: discard queued ops, do NOT write, do NOT commit.
+        # The pre-write commit may have already happened if file was dirty;
+        # that is acceptable (it captures real prior state).
+        # On clean exit with no queued ops: no-op.
+        # On clean exit with queued ops: apply, write, post-commit, audit.
+        ...
+
+    # Operation queue API (all return self for chaining)
+    def replace(self, *, line_start: int, line_end: int, content: str) -> "Transaction": ...
+    def insert_tag(self, *, line: int, tag: str, content: str) -> "Transaction": ...
+    def strip_comment(self, *, line: int) -> "Transaction": ...
+    def replace_lines(self, *, line_start: int, line_end: int, content: str) -> "Transaction": ...
+
+    # Introspection (used by tests)
+    @property
+    def queued(self) -> list[EditOp]: ...
+```
+
+**Module-level entrypoint:**
+
+```python
+def update(path: str, *, project_root: str = "/project") -> Transaction:
+    return Transaction(path, project_root=project_root)
+```
+
+**Lifecycle (the bracket):**
+
+1. `__enter__`:
+   - Read file, capture `pre_hash` (sha256).
+   - If `git status --porcelain -- <path>` shows the file is dirty
+     (modified vs HEAD), commit it now with message
+     `pidgin/update: pre-bracket snapshot of <relpath>`.
+     If clean: SKIP the pre-commit (no point committing identical state).
+2. Operations queue in `self._ops`. Nothing on disk changes during
+   the block.
+3. `__exit__` (no exception, ops queued):
+   - Apply ops in queue order to an in-memory copy of the file lines.
+   - Write atomically (os.replace via .tmp).
+   - Capture `post_hash`.
+   - `git add -- <path>` + `git commit -m "pidgin/update: <relpath> (<N> ops)"`.
+     Capture commit SHA.
+   - Append ONE JSONL line to /project/.pidgin/audit/update.jsonl with:
+     timestamp, audit_id, path, pre_hash, post_hash, pre_commit_sha
+     (or null), post_commit_sha, ops (list of EditOp dicts), bytes_before,
+     bytes_after.
+
+**Operation semantics:**
+
+- `replace(line_start, line_end, content)`: replace lines
+  [line_start..line_end] inclusive with `content`. If `content` ends
+  without `\n`, append one. If `line_start > line_end`, raise ValueError.
+- `insert_tag(line, tag, content)`: insert a comment block IMMEDIATELY
+  BEFORE the given line. The block is language-detected from the file
+  extension: `.py` → `# <tag>` / `# <content lines>` / `# </tag>`.
+  For non-`.py` files, raise NotImplementedError (M3-onward XML
+  prompt work doesn't exercise non-Python paths).
+- `strip_comment(line)`: if `line` is a `#` comment, delete it (the
+  whole physical line). If not a comment, no-op (record in op list
+  with metadata={"noop": True}).
+- `replace_lines`: alias of `replace`, present for callers that prefer
+  the explicit name.
+
+**Conflict detection:**
+
+Operations are applied in queue order against an in-memory mutable list.
+Line numbers in subsequent ops refer to the ORIGINAL file (pre-edit)
+line numbers — the implementation must compute a running line offset
+to translate. If two ops target overlapping ranges in the original
+file, raise `OverlappingEdit` on commit.
+
+**Exception path:**
+
+If an exception is raised inside the `with` block, queued ops are
+discarded. If `pre-bracket snapshot` was committed, it stays — that
+captured real prior state and rolling it back would lose work. The
+audit entry is NOT written for failed transactions.
+
+**Provenance comment** (top of update.py):
+
+```python
+# pidgin v0.2 — extracted from tools/store/audit.py (v0.1).
+# Provenance: `crispr_write`, `crispr_edit`, hash-verification helpers.
+# Behaviour change vs v0.1: bracket wraps the FILE, not each operation
+# (write-model.md, Mode 2). Operations accumulate in memory and apply
+# atomically on context exit.
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m2 && cp /project/tools/store/audit.py /tmp/m2/audit.py.bak`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. Read /project/tools/store/audit.py. Locate `crispr_write` /
+`crispr_edit`. Note the hash-verification semantics, the JSONL fields,
+and the operation kinds currently supported.
+FAIL: SOFT
+
+Step 3. RUN: `test -f /project/pidgin/write/__init__.py`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (M1 must have run; package skeleton must exist)
+
+**Phase 1 — Write**
+
+Step 4. Write /project/pidgin/write/update.py per the specification.
+FAIL: HARD
+
+Step 5. Edit /project/pidgin/write/__init__.py to add:
+`from .update import update, Transaction, EditOp, OverlappingEdit`.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 6. RUN: `python -c "from pidgin.write import update, Transaction, EditOp; print('ok')"`
+(cwd /project)
+EXPECT CONTAINS: ok
+FAIL: HARD
+
+Step 7. Write /tmp/m2/test_update.py:
+
+```python
+import os, json, subprocess, tempfile, sys, hashlib
+sys.path.insert(0, "/project")
+from pidgin.write import update
+
+with tempfile.TemporaryDirectory() as d:
+    subprocess.check_call(["git", "init", "-q"], cwd=d)
+    subprocess.check_call(["git", "config", "user.email", "test@local"], cwd=d)
+    subprocess.check_call(["git", "config", "user.name", "test"], cwd=d)
+
+    target = os.path.join(d, "sample.py")
+    open(target, "w").write("\n".join(f"# line {i}" for i in range(1, 11)) + "\n")
+    subprocess.check_call(["git", "add", "sample.py"], cwd=d)
+    subprocess.check_call(["git", "commit", "-q", "-m", "init"], cwd=d)
+
+    # Clean file → no pre-commit. Five ops queued. Expect exactly 1 new commit.
+    pre_log = subprocess.check_output(["git", "log", "--oneline"], cwd=d).decode().count("\n")
+
+    with update(target, project_root=d) as f:
+        f.replace(line_start=1, line_end=1, content="# replaced 1")
+        f.replace(line_start=3, line_end=3, content="# replaced 3")
+        f.replace(line_start=5, line_end=5, content="# replaced 5")
+        f.replace(line_start=7, line_end=7, content="# replaced 7")
+        f.replace(line_start=9, line_end=9, content="# replaced 9")
+
+    post_log = subprocess.check_output(["git", "log", "--oneline"], cwd=d).decode().count("\n")
+    assert post_log - pre_log == 1, f"expected exactly 1 new commit, got {post_log - pre_log}"
+
+    audit = open(os.path.join(d, ".pidgin/audit/update.jsonl")).read().strip().split("\n")
+    assert len(audit) == 1, f"expected 1 audit entry, got {len(audit)}"
+    entry = json.loads(audit[0])
+    assert len(entry["ops"]) == 5, f"expected 5 ops, got {len(entry['ops'])}"
+    assert entry["pre_commit_sha"] is None  # file was clean
+    assert entry["post_commit_sha"]
+    print("PASS")
+```
+
+FAIL: HARD
+
+Step 8. RUN: `python /tmp/m2/test_update.py`
+EXPECT CONTAINS: PASS
+FAIL: HARD
+
+Step 9. RUN: `python -c "
+import sys; sys.path.insert(0, '/project')
+from pidgin.write import update, OverlappingEdit
+import tempfile, subprocess, os
+with tempfile.TemporaryDirectory() as d:
+    subprocess.check_call(['git','init','-q'],cwd=d)
+    subprocess.check_call(['git','config','user.email','t@l'],cwd=d)
+    subprocess.check_call(['git','config','user.name','t'],cwd=d)
+    p = os.path.join(d,'a.py'); open(p,'w').write('a\nb\nc\nd\n')
+    subprocess.check_call(['git','add','a.py'],cwd=d)
+    subprocess.check_call(['git','commit','-q','-m','i'],cwd=d)
+    try:
+        with update(p, project_root=d) as f:
+            f.replace(line_start=1, line_end=2, content='X')
+            f.replace(line_start=2, line_end=3, content='Y')  # overlap
+        print('NOFAIL')
+    except OverlappingEdit:
+        print('OVERLAP_DETECTED')
+"`
+EXPECT CONTAINS: OVERLAP_DETECTED
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 10. Edit /project/pidgin/write/CLAUDE.md (created in M1) to add
+the Update mode entry, function signatures, EditOp kinds, and the
+"bracket wraps the file" rule.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 11. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 2 Report
+
+**Status:** GREEN | RED
+**Files written:** list with line counts
+**Files modified:** /project/pidgin/write/__init__.py,
+                    /project/pidgin/write/CLAUDE.md
+
+### Step Results
+Per the mission-grammar template.
+
+### Self-Test Output
+Paste stdout of both test runs (Step 8 and Step 9).
+
+### Key Observations
+- Did the dirty-file pre-commit path get exercised? If not, note that
+  it is implemented but unverified by this mission (M3 prompt rewrite
+  may exercise it incidentally).
+- How did you compute running line offsets for queued ops? Document the
+  approach so the reviewer can sanity-check.
+
+### Anomalies
+- Insert_tag language detection scope (only .py supported per spec).
+- Operation ordering rules and any divergence.
+
+### Risks
+- (HIGH) Overlapping edits passing detection silently would corrupt
+  the file. Detection logic is the load-bearing safety check.
+- (MED) Atomic-write same-filesystem assumption (EXDEV on cross-mount).
+- (MED) The pre-bracket snapshot commit on dirty files leaves stranded
+  commits in repo history if the transaction then fails — by design,
+  but worth flagging for the operator.
+- (LOW) `strip_comment` no-op semantics may surprise callers expecting
+  a hard error on non-comment lines.
+
+### Rollback
+`rm /project/pidgin/write/update.py` and revert
+/project/pidgin/write/__init__.py to its M1 state. Backup at
+/tmp/m2/audit.py.bak (unchanged — restore is a no-op).
+      ]]></report>
+    </mission>
+
+    <mission n="3" tier="execute" review="true">
+      <context><![CDATA[
+v0.1 used `tools/prompts/generate.md` (~960 lines of markdown) as the
+generation prompt for MLD convergence. Anthropic's prompting guidance
+states XML tags are the preferred structuring mechanism for Claude.
+xml-prompt-format.md specifies the migration: a `<pidgin_prompt>`
+document with `<role>`, `<principles>`, `<rules>`, `<examples>`
+above the cache boundary and `<payload>` + `<output_schema>` below.
+The cached preamble becomes the cacheable prefix; the payload varies
+per call.
+
+This mission rewrites generate.md as pidgin/prompts/converge.xml. The
+regression test compares convergence ratios against the v0.1 baseline
+on the same 4 reference probes — XML migration must not degrade
+convergence quality.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Author /project/pidgin/prompts/converge.xml in the format specified
+   by xml-prompt-format.md.
+2. Identify the cache boundary explicitly (XML comment marker).
+3. Run 4 reference MLD probes (the same v2-validation functions:
+   embed, main, apply, merge) against the new prompt.
+4. Compare convergence counts against the v0.1 baseline (target: 4/4
+   converged, matching v2-mld-validation). SOFT-fail on count
+   regression for architect review; HARD-fail only if XML parses
+   incorrectly or the prompt produces 0 candidates (catastrophic
+   regression).
+5. Record per-probe results into /project/local/sprints/tooling-v0.2/probes/m3-converge-xml/.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to create:**
+
+- /project/pidgin/prompts/converge.xml
+  Provenance: tools/prompts/generate.md (v0.1).
+- /project/pidgin/prompts/__init__.py — empty marker.
+
+**Document structure (well-formed XML):**
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<pidgin_prompt verb="converge" doc_type="function_description" version="1">
+  <role>
+    You are the MLD convergence generator. Produce three drafts at
+    increasing refinement that describe the function in the payload
+    using the minimum tokens to remain lossless.
+  </role>
+
+  <principles>
+    <!-- MLD-compressed principles, injected by templates.assemble_xml_prompt.
+         At authoring time, leave a placeholder block; M5 wires injection. -->
+    <principle id="PLACEHOLDER">{{principle_body}}</principle>
+  </principles>
+
+  <rules>
+    <rule id="1">Begin with an imperative verb (Compute, Return, Merge…).</rule>
+    <rule id="2">Use no metaphors, no motivation, no examples.</rule>
+    <rule id="3">Stop at the natural lossless length within the token budget.</rule>
+    <rule id="4">Each successive draft is shorter than the previous unless
+                 the previous was already lossless.</rule>
+    <!-- Lift remaining rules from generate.md verbatim, one per <rule>. -->
+  </rules>
+
+  <examples>
+    <example type="positive">
+      <input>...verbatim from generate.md...</input>
+      <output>...verbatim...</output>
+    </example>
+    <anti_example source="v1_validation">
+      <output>Merge delta into a copy of state,</output>
+      <reason>Truncated mid-clause; v1 hard-budget artifact.</reason>
+    </anti_example>
+    <!-- One positive + at least one anti-example carried from generate.md. -->
+  </examples>
+
+  <!-- ===== CACHE BOUNDARY ===== Everything above is the cached preamble. -->
+
+  <payload>
+    <function file="{{file}}" name="{{name}}" line_start="{{line_start}}">
+      [CDATA-OPEN]
+        {{function_body}}
+      [CDATA-CLOSE]
+    </function>
+  </payload>
+
+  <output_schema>
+    <field name="draft_1" type="string" min_tokens="1" max_tokens="120"/>
+    <field name="draft_2" type="string" min_tokens="1" max_tokens="80"/>
+    <field name="draft_3" type="string" min_tokens="1" max_tokens="60"/>
+  </output_schema>
+</pidgin_prompt>
+```
+
+The CACHE BOUNDARY comment is mandatory and must appear exactly once.
+M5's `assemble_xml_prompt` will split on it.
+
+**Migration rules:**
+
+- Every rule from generate.md becomes a `<rule>` element. Verbatim text;
+  only structural change.
+- Every example becomes an `<example>` (positive) or `<anti_example>`
+  (negative). The anti-examples carry forward `source` attributes
+  (e.g. `v1_validation`).
+- Markdown formatting INSIDE `<rule>` and `<example>` content is fine
+  per xml-prompt-format.md ("Markdown can exist inside XML tags").
+- Soft-budget instruction (the conciseness clause) lives in `<role>` or
+  `<rules>`, NOT in `<output_schema>`. The schema is the API contract;
+  the instruction is the model behaviour.
+
+**Reference probe set (v2-mld-validation parity):**
+
+The 4 reference functions live in v0.1 source. Locate them by searching:
+
+| Probe ID | Source file | Function |
+|----------|-------------|----------|
+| P1 | tools/utils/api.py | embed_for_store |
+| P2 | tools/__main__.py (or wherever v0.1 keeps it) | main |
+| P3 | tools/utils/sections.py | apply (state-merge) |
+| P4 | tools/utils/sections.py | merge (centroid merge) |
+
+If the exact functions are no longer at those paths (post-refactor),
+fall back to the four functions named in v2-founding-record.md
+("embed, main, apply, merge"). Document the substitution in the report.
+
+**Probe harness:**
+
+Use the existing v0.1 MLD pipeline (tools/mld/pipeline.py via
+tools/utils/api.py). Invoke it with the new XML prompt as the
+generation prompt. The pipeline must accept a prompt path or string;
+if it currently hardcodes generate.md, add a one-line parameter
+(`prompt_text: str | None = None` defaulting to the historical
+behaviour) and wire it through. This is a known intrusion into
+extracted code and is acceptable scope for M3.
+
+**Probe parameters (match v2 baseline):**
+
+- N candidates per probe: 5 calls × 3 drafts = 15
+- Model: gpt-4.1-nano (Decision 6 fixes embedding model only;
+  generation model is fixed by v0.1 evidence in v2-founding-record.md)
+- Embedding model: text-embedding-3-small @ 256 dim (Decision 6)
+- Soft budget ceiling: 500 tokens
+- Convergence threshold: cosine similarity per v0.1 antipode test
+
+**Acceptance:**
+
+- HARD: All 4 probes return >0 candidates AND the XML parses cleanly.
+- SOFT: Convergence ratio per probe matches v0.1 baseline (4/4).
+  If any probe converges below the v0.1 result, report it for
+  architect review but do NOT fail the mission.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m3 /project/local/sprints/tooling-v0.2/probes/m3-converge-xml`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `cp /project/tools/prompts/generate.md /tmp/m3/generate.md.bak`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 3. Read /project/tools/prompts/generate.md to capture every rule,
+example, and anti-example. Document the count of each in the report.
+FAIL: SOFT
+
+Step 4. Read /project/local/sprints/tooling-v0.1/context/v2-mld-validation.md
+(if it exists) to capture the v0.1 baseline convergence ratios.
+FAIL: SOFT  (if missing, use 4/4 as the assumed baseline per
+              v2-founding-record.md)
+
+**Phase 1 — Write**
+
+Step 5. Write /project/pidgin/prompts/__init__.py (empty marker with
+provenance line).
+FAIL: HARD
+
+Step 6. Write /project/pidgin/prompts/converge.xml per the spec, with
+the CACHE BOUNDARY comment exactly once and all rules/examples
+migrated.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 7. RUN: `python -c "import xml.etree.ElementTree as ET; ET.parse('/project/pidgin/prompts/converge.xml'); print('valid')"`
+EXPECT CONTAINS: valid
+FAIL: HARD
+
+Step 8. RUN: `grep -c '===== CACHE BOUNDARY =====' /project/pidgin/prompts/converge.xml`
+EXPECT MATCHES: ^1$
+FAIL: HARD
+
+Step 9. RUN: `python -c "
+import xml.etree.ElementTree as ET
+t = ET.parse('/project/pidgin/prompts/converge.xml').getroot()
+print('rules:', len(t.findall('rules/rule')))
+print('examples:', len(t.findall('examples/example')))
+print('anti:', len(t.findall('examples/anti_example')))
+print('schema_fields:', len(t.findall('output_schema/field')))
+"`
+EXPECT CONTAINS: schema_fields: 3
+FAIL: HARD
+
+Step 10. Write /tmp/m3/run_probes.py — a script that imports the v0.1
+MLD pipeline, swaps the generation prompt for converge.xml, runs
+the 4 reference probes, and writes per-probe JSON results to
+/project/local/sprints/tooling-v0.2/probes/m3-converge-xml/<probe>.json.
+The script must print one summary line per probe in the form:
+`<probe_id> converged=<N>/15 cluster=<N>`.
+FAIL: HARD
+
+Step 11. RUN: `python /tmp/m3/run_probes.py 2>&1 | tee /tmp/m3/probes.log`
+EXPECT CONTAINS: converged=
+FAIL: HARD  (catastrophic regression: HARD if ANY probe returns 0
+             candidates; otherwise see Step 12)
+
+Step 12. RUN: `python -c "
+import re
+log = open('/tmp/m3/probes.log').read()
+hits = re.findall(r'converged=(\d+)/15', log)
+total = sum(int(h) >= 8 for h in hits)  # 8/15 ~ majority cluster threshold
+print(f'PROBES_PASSED: {total}/4')
+"`
+EXPECT MATCHES: PROBES_PASSED: [0-9]/4
+FAIL: SOFT  (a value below 4 triggers architect review; M3 still GREEN)
+
+**Phase 3 — Documentation**
+
+Step 13. Write /project/pidgin/prompts/CLAUDE.md — discovery index for
+converge.xml: cache boundary location, schema fields, rule count,
+example count, provenance.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 14. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 3 Report
+
+**Status:** GREEN | RED
+**Files written:** list with sizes
+**Files modified:** tools/mld/pipeline.py if `prompt_text` parameter
+                    was added (document the diff)
+
+### Step Results
+Per the template.
+
+### Migration Inventory
+- Rules migrated: <N> (vs generate.md count: <M>)
+- Positive examples: <N>
+- Anti-examples: <N>
+- Tokens in cached preamble (rough wc -w on `<role>`+`<principles>`+
+  `<rules>`+`<examples>`): ~<N>
+
+### Probe Results
+Table per-probe: probe_id, function, converged_count, cluster_size,
+v0.1_baseline, regression?
+
+### Key Observations
+- Was the v0.1 baseline file (v2-mld-validation.md) actually present?
+- Did pipeline.py need a parameter intrusion? If yes, exact diff.
+- Any prompt that converged BELOW v0.1 baseline — quote the converged
+  candidates so the reviewer can compare.
+
+### Anomalies
+- Probe substitutions (if any reference functions had moved).
+- Rate-limit retries observed.
+
+### Risks
+- (HIGH) If XML wrapping introduced any parse-ambiguity inside
+  `<function>` body CDATA, downstream prompts may receive corrupted
+  payloads — verify in M5 templates.assemble.
+- (MED) The cached preamble is now ~<N> tokens larger/smaller than the
+  markdown version; downstream cost projections need update.
+- (LOW) Soft-budget instruction placement in `<role>` vs `<rules>` may
+  affect compliance — note for M5 template assembly review.
+
+### Rollback
+`rm /project/pidgin/prompts/converge.xml` and revert any pipeline.py
+change. /tmp/m3/generate.md.bak is the verbatim v0.1 prompt.
+      ]]></report>
+    </mission>
+
+    <mission n="4" tier="execute" review="true">
+      <context><![CDATA[
+v0.1 used `tools/prompts/validate.md` as the gate prompt — the LLM
+validation gate that replaced v0's mechanical grammar filter
+(grammar filter rejected 0/140 candidates, validated as dead code in
+v2-founding-record.md). xml-prompt-format.md requires the same XML
+migration applied to validate.md → pidgin/prompts/gate.xml. Gate calls
+return structured `{valid: bool, reason: string}` via response_format;
+the schema lives in the prompt as `<output_schema>`.
+
+This mission rewrites validate.md as gate.xml and runs it against 4
+already-converged v0.1 descriptions. All 4 must pass — the gate is
+not the regression test for the descriptions, it's the regression
+test for the gate prompt.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Author /project/pidgin/prompts/gate.xml.
+2. Cache boundary explicit, identical structural convention to
+   converge.xml.
+3. Run gate against 4 v0.1 converged descriptions (from
+   v2-mld-validation or, fallback, the descriptions emitted by M3's
+   probes). All must return `valid: true`.
+4. Self-test: run gate on a deliberately corrupted candidate
+   (truncated mid-sentence) and verify `valid: false`.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to create:**
+
+- /project/pidgin/prompts/gate.xml
+  Provenance: tools/prompts/validate.md (v0.1).
+
+**Document structure:**
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<pidgin_prompt verb="gate" doc_type="function_description" version="1">
+  <role>
+    You are the MLD validation gate. Decide whether the candidate
+    description is COMPLETE, CORRECT, and FOLLOWS THE RULES.
+  </role>
+
+  <criteria>
+    <criterion id="1">Begins with an imperative verb.</criterion>
+    <criterion id="2">No metaphors, no motivation, no examples.</criterion>
+    <criterion id="3">Lossless: no truncation, no hanging clauses.</criterion>
+    <criterion id="4">Faithful to the function body — no claims about
+                       behaviour the function does not perform.</criterion>
+    <!-- Lift remaining criteria from validate.md verbatim. -->
+  </criteria>
+
+  <examples>
+    <example verdict="valid">
+      <function>...</function>
+      <candidate>...</candidate>
+      <reason>Imperative, lossless, faithful.</reason>
+    </example>
+    <example verdict="invalid">
+      <function>...</function>
+      <candidate>Merge delta into a copy of state,</candidate>
+      <reason>Truncated mid-clause.</reason>
+    </example>
+  </examples>
+
+  <!-- ===== CACHE BOUNDARY ===== -->
+
+  <payload>
+    <function file="{{file}}" name="{{name}}">
+      [CDATA-OPEN]
+        {{function_body}}
+      [CDATA-CLOSE]
+    </function>
+    <candidate>{{candidate_text}}</candidate>
+  </payload>
+
+  <output_schema strict="true">
+    <field name="valid" type="boolean"/>
+    <field name="reason" type="string" max_tokens="60"/>
+  </output_schema>
+</pidgin_prompt>
+```
+
+**Schema enforcement:**
+
+- response_format: json_schema with the two fields above.
+- `valid` MUST be boolean (true/false), not "yes"/"no".
+- `reason` capped at ~60 tokens; the gate's job is to return a
+  verdict, not to write essays.
+
+**Test cases:**
+
+| Case | Source | Expected verdict |
+|------|--------|------------------|
+| G1 | v0.1 converged description for `embed_for_store` | valid |
+| G2 | v0.1 converged description for `main` | valid |
+| G3 | v0.1 converged description for `apply` | valid |
+| G4 | v0.1 converged description for `merge` | valid |
+| G5 | "Merge delta into a copy of state," (V1 truncation) | invalid |
+
+If the v0.1 converged descriptions cannot be located, use the M3
+converged outputs from /project/local/sprints/tooling-v0.2/probes/m3-converge-xml/.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m4`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `cp /project/tools/prompts/validate.md /tmp/m4/validate.md.bak`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 3. Read /project/tools/prompts/validate.md. Note every criterion
+and example.
+FAIL: SOFT
+
+Step 4. RUN: `test -f /project/pidgin/prompts/__init__.py`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (M3 must have run)
+
+**Phase 1 — Write**
+
+Step 5. Write /project/pidgin/prompts/gate.xml per the spec.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 6. RUN: `python -c "import xml.etree.ElementTree as ET; ET.parse('/project/pidgin/prompts/gate.xml'); print('valid')"`
+EXPECT CONTAINS: valid
+FAIL: HARD
+
+Step 7. RUN: `grep -c '===== CACHE BOUNDARY =====' /project/pidgin/prompts/gate.xml`
+EXPECT MATCHES: ^1$
+FAIL: HARD
+
+Step 8. RUN: `python -c "
+import xml.etree.ElementTree as ET
+t = ET.parse('/project/pidgin/prompts/gate.xml').getroot()
+fields = t.findall('output_schema/field')
+assert len(fields) == 2, fields
+assert fields[0].get('name') == 'valid' and fields[0].get('type') == 'boolean'
+assert fields[1].get('name') == 'reason'
+print('schema_ok')
+"`
+EXPECT CONTAINS: schema_ok
+FAIL: HARD
+
+Step 9. Write /tmp/m4/run_gate.py — loads the four v0.1 converged
+descriptions (or M3 outputs as fallback), runs the gate via the
+existing v0.1 gate API path with gate.xml swapped in, prints one line
+per case: `<case_id> verdict=<true|false> reason=<...>`.
+FAIL: HARD
+
+Step 10. RUN: `python /tmp/m4/run_gate.py 2>&1 | tee /tmp/m4/gate.log`
+EXPECT CONTAINS: G1 verdict=
+FAIL: HARD
+
+Step 11. RUN: `python -c "
+import re
+log = open('/tmp/m4/gate.log').read()
+g1to4 = re.findall(r'G[1-4] verdict=true', log)
+g5 = re.findall(r'G5 verdict=false', log)
+print(f'POSITIVES: {len(g1to4)}/4 NEGATIVE: {len(g5)}/1')
+"`
+EXPECT CONTAINS: POSITIVES: 4/4 NEGATIVE: 1/1
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 12. Edit /project/pidgin/prompts/CLAUDE.md (created in M3) to add
+the gate.xml entry: criteria count, schema fields, example verdicts.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 13. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 4 Report
+
+**Status:** GREEN | RED
+**Files written:** /project/pidgin/prompts/gate.xml
+**Files modified:** /project/pidgin/prompts/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Gate Results
+Table: case_id, candidate (one-line excerpt), verdict, reason.
+
+### Key Observations
+- Did all four v0.1 descriptions pass cleanly? Quote any reason text
+  that approaches the 60-token cap (signals a borderline case).
+- Was the negative case (G5) detected for the right reason
+  (truncation), or did the model identify a different fault?
+
+### Anomalies
+- Where the v0.1 descriptions came from (v2-mld-validation.md vs M3 fallback).
+- Any criterion in validate.md that did not migrate cleanly to XML.
+
+### Risks
+- (HIGH) A gate that always says `valid: true` is worse than no gate.
+  Verify negative case (G5) returned false for the truncation reason.
+- (MED) Schema strict-mode may behave differently across model
+  versions; lock in gpt-4.1-nano per v2-founding-record.md.
+- (LOW) Reason field cap may be too tight for complex anti-patterns
+  surfaced later; revisit empirically.
+
+### Rollback
+`rm /project/pidgin/prompts/gate.xml`. validate.md.bak preserved at
+/tmp/m4 (no v0.1 file modified).
+      ]]></report>
+    </mission>
+
+    <mission n="5" tier="execute" review="true">
+      <context><![CDATA[
+M3 and M4 produced converge.xml and gate.xml as templates with literal
+{{placeholder}} regions. The runtime needs an assembler that:
+1. Reads the template XML.
+2. Replaces {{placeholders}} with concrete values.
+3. Optionally injects a SUBSET of MLD-compressed principles by id —
+   the selective-injection mechanism described in
+   origami-compression-findings.md (3 principles ≈ 45 tokens vs ~600
+   tokens for full bodies, an order-of-magnitude saving in the
+   cached preamble).
+4. Splits the assembled string at the `===== CACHE BOUNDARY =====`
+   marker so callers can pass `cached_preamble` and `payload`
+   separately to the API (the prompt-caching boundary is explicit at
+   call time).
+
+This mission also stands up the MLD-compressed principle registry
+data structure that templates.py reads from. The registry is sourced
+from /project/ORIGAMI.md (the artefact produced by v0.1's M14
+Origami reprocessing), parsed at import time.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement /project/pidgin/prompts/templates.py with
+   `assemble_xml_prompt`, `load_principle_registry`, and an
+   `AssembledPrompt` return type.
+2. Wire selective principle injection: caller supplies `principles=[1,3,7]`
+   and templates inserts only those `<principle>` elements.
+3. Provide a `cached_preamble`/`payload` split at the CACHE BOUNDARY
+   comment.
+4. Self-test: assemble converge.xml with principles=[1,3,7] and a sample
+   function payload, verify principle token count ≤ 120 tokens (rough
+   word count proxy: ≤ 90 words) and full-body equivalent ≥ 400 tokens
+   (≥ 300 words).
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to create:**
+
+- /project/pidgin/prompts/templates.py
+  Provenance: NEW (no v0.1 equivalent — selective injection didn't exist).
+  Conceptual basis: origami-compression-findings.md.
+
+**Data types:**
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class AssembledPrompt:
+    cached_preamble: str   # XML fragment, everything ABOVE the boundary
+    payload: str           # XML fragment, everything BELOW (payload + schema)
+    full: str              # cached_preamble + "\n" + payload, for clients that
+                           # don't separate caching boundaries
+    principles_used: list[int]
+    payload_vars: dict     # the substitution dict actually applied
+```
+
+**Principle registry:**
+
+```python
+@dataclass(frozen=True)
+class Principle:
+    id: int
+    title: str             # e.g. "Daft Punk Principle"
+    mld: str               # MLD-compressed body (single sentence usually)
+    full: str | None       # full body if available, else None
+
+PRINCIPLES: dict[int, Principle]   # populated at import by load_principle_registry()
+```
+
+**load_principle_registry:**
+
+```python
+def load_principle_registry(
+    origami_path: str = "/project/ORIGAMI.md",
+) -> dict[int, Principle]: ...
+```
+
+Behaviour:
+- Read ORIGAMI.md.
+- Parse principles. The expected format produced by v0.1 M14 is a
+  numbered list with each principle as a header + body. Locate the
+  MLD-compressed line (typically the first sentence of the body).
+- Return `{id: Principle(...), ...}` for all parsed principles.
+- If ORIGAMI.md is missing OR no principles parse: return `{}` and
+  log a warning. Do NOT raise — the assembler must still work without
+  a registry (assemble with `principles=[]` is a valid call).
+
+**assemble_xml_prompt:**
+
+```python
+def assemble_xml_prompt(
+    template_path: str,                    # absolute path to .xml template
+    payload_vars: dict,                    # {"file": ..., "name": ..., "function_body": ...}
+    *,
+    principles: list[int] = (),            # ids to inject; empty = no <principle> elements
+    registry: dict[int, Principle] | None = None,  # default: module-level PRINCIPLES
+) -> AssembledPrompt: ...
+```
+
+Behaviour:
+1. Read the template as TEXT (not parsed XML — parsing would mangle
+   CDATA and the boundary comment).
+2. Find the `<principles>` block. Replace its INNER content with
+   exactly the requested principles' MLD bodies, one
+   `<principle id="N">{mld}</principle>` per id, in numeric order.
+   If `principles=[]`, the `<principles>` element is preserved with
+   empty inner content (so downstream parsers don't choke on a
+   missing element).
+3. Replace `{{key}}` placeholders in the payload region with values
+   from `payload_vars`. Missing keys raise `KeyError(key)`.
+4. Split the resulting string on the literal
+   `<!-- ===== CACHE BOUNDARY ===== -->` marker (the comment line).
+   Everything before becomes `cached_preamble`; everything after
+   becomes `payload`. The marker line itself is discarded.
+5. Return AssembledPrompt with both halves and `full` as their
+   concatenation.
+
+**Token counting (for the self-test):**
+
+Use a word-count proxy: `len(text.split())`. Real tokenisation differs
+but the order-of-magnitude check is what the test enforces.
+
+**Provenance comment:**
+
+```python
+# pidgin v0.2 — NEW.
+# Implements selective-principle injection per
+# origami-compression-findings.md: ~45 tokens for 3 MLD principles vs
+# ~600 tokens for full bodies. The cached_preamble/payload split makes
+# the prompt-caching boundary explicit at call time.
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m5 && cp /project/ORIGAMI.md /tmp/m5/ORIGAMI.md.bak 2>/dev/null || echo MISSING`
+FAIL: SOFT  (ORIGAMI.md may not exist; loader must handle that)
+
+Step 2. RUN: `test -f /project/pidgin/prompts/converge.xml -a -f /project/pidgin/prompts/gate.xml`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (M3 and M4 must have run)
+
+**Phase 1 — Write**
+
+Step 3. Write /project/pidgin/prompts/templates.py per the
+specification.
+FAIL: HARD
+
+Step 4. Edit /project/pidgin/prompts/__init__.py to export:
+`from .templates import assemble_xml_prompt, AssembledPrompt, Principle, PRINCIPLES, load_principle_registry`.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 5. RUN: `python -c "from pidgin.prompts import assemble_xml_prompt, PRINCIPLES; print('imports_ok', 'principles_loaded:', len(PRINCIPLES))"`
+(cwd /project)
+EXPECT CONTAINS: imports_ok
+FAIL: HARD
+
+Step 6. Write /tmp/m5/test_assemble.py:
+
+```python
+import sys
+sys.path.insert(0, "/project")
+from pidgin.prompts import assemble_xml_prompt, PRINCIPLES
+
+payload_vars = {
+    "file": "tools/utils/api.py",
+    "name": "embed_for_store",
+    "line_start": "42",
+    "function_body": "def embed_for_store(text):\n    return client.embed(text)\n",
+}
+
+# Selective: principles 1, 3, 7 if present in the registry. If the
+# registry is empty (ORIGAMI.md missing), use empty list — the test
+# then verifies the empty path behaves correctly.
+ids = [i for i in (1, 3, 7) if i in PRINCIPLES][:3] if PRINCIPLES else []
+
+a = assemble_xml_prompt(
+    "/project/pidgin/prompts/converge.xml",
+    payload_vars,
+    principles=ids,
+)
+
+# Boundary split
+assert a.cached_preamble, "cached_preamble empty"
+assert a.payload, "payload empty"
+assert "<role>" in a.cached_preamble
+assert "<payload>" in a.payload
+assert "<output_schema" in a.payload
+assert "{{" not in a.payload, "unsubstituted placeholder in payload"
+
+# Selective injection
+if ids:
+    selected_words = sum(len(PRINCIPLES[i].mld.split()) for i in ids)
+    full_words = sum(len((PRINCIPLES[i].full or PRINCIPLES[i].mld).split()) for i in ids)
+    print(f"PRINCIPLE_WORDS selected={selected_words} full={full_words}")
+    # Selective should be at most ~90 words for 3 principles (45-tokens-ish proxy)
+    assert selected_words <= 90, f"selective too large: {selected_words}"
+    # Sanity: full bodies must be substantially larger if the registry
+    # actually has full bodies. If full bodies are not present, skip.
+    if any(PRINCIPLES[i].full for i in ids):
+        assert full_words >= 300, f"full bodies should be >=300 words: {full_words}"
+else:
+    print("PRINCIPLE_WORDS selected=0 full=0 (empty registry)")
+
+print("PASS")
+```
+
+FAIL: HARD
+
+Step 7. RUN: `python /tmp/m5/test_assemble.py`
+EXPECT CONTAINS: PASS
+FAIL: HARD
+
+Step 8. RUN: `python -c "
+import sys; sys.path.insert(0, '/project')
+from pidgin.prompts import assemble_xml_prompt
+try:
+    assemble_xml_prompt('/project/pidgin/prompts/converge.xml', {'file': 'x'}, principles=[])
+except KeyError as e:
+    print('KEY_ERROR_RAISED:', e)
+"`
+EXPECT CONTAINS: KEY_ERROR_RAISED
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 9. Edit /project/pidgin/prompts/CLAUDE.md to add the templates.py
+entry: `assemble_xml_prompt`, `load_principle_registry`,
+selective-injection rationale (45 vs 600 tokens).
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 5 Report
+
+**Status:** GREEN | RED
+**Files written:** /project/pidgin/prompts/templates.py
+**Files modified:** /project/pidgin/prompts/__init__.py,
+                    /project/pidgin/prompts/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Registry Status
+- ORIGAMI.md present: yes/no
+- Principles parsed: <N>
+- Sample MLD body for principle 1 (one line)
+- Are full bodies stored alongside MLD bodies? If no, the full-vs-MLD
+  comparison degrades to "selective vs nothing" — note this.
+
+### Self-Test Output
+Paste stdout from /tmp/m5/test_assemble.py exactly.
+
+### Key Observations
+- Cache boundary split: cached_preamble byte size, payload byte size.
+- KeyError on missing placeholder: confirmed.
+
+### Anomalies
+- Any divergence from the spec needed to make assembly work
+  (e.g. CDATA handling inside the function payload).
+
+### Risks
+- (HIGH) ORIGAMI.md format may differ from what the loader expects;
+  if registry is consistently empty, M14/M15 probes lose
+  selective-injection benefit silently.
+- (MED) Word-count proxy for token counts is rough; M11 (CLI) should
+  upgrade to the OpenAI tokenizer when available.
+- (MED) String-replace approach to {{placeholder}} substitution is
+  fragile if a function body legitimately contains `{{`-like tokens
+  in source code; document this limitation.
+- (LOW) Splitting on a comment marker means any future template
+  authoring error (typo in the marker) silently fails the split.
+
+### Rollback
+`rm /project/pidgin/prompts/templates.py` and revert
+/project/pidgin/prompts/__init__.py.
+      ]]></report>
+    </mission>
+
+    <mission n="6" tier="execute" review="true">
+      <context><![CDATA[
+v0.1 made sequential async API calls and hit rate limits during M14
+(Origami reprocessing: 19 × 10 × 3 = 570 sequential calls, ~15 minutes
+wall time). batch-dispatch.md specifies the OpenAI Batch API
+integration: 50% cost discount, separate higher rate-limit pool,
+identical preambles with varying payloads — the ideal batch workload.
+
+This mission ships the GENERATION batch path. M7 will add the
+embedding batch path. M9 will add Anthropic's Message Batches API for
+gate calls. The auto-threshold from Decision 4 (DP4): under 10 tasks
+synchronous, at-or-above 10 batch. The user can force `--sync` or
+`--batch`.
+
+The convergence algorithm downstream MUST NOT know whether candidates
+arrived synchronously or via batch — both paths produce identical data
+structures.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement /project/pidgin/pipeline/batch.py with the generation
+   batch path: build JSONL, upload, submit, poll, parse, return
+   candidates by custom_id.
+2. Implement `should_use_batch(n_tasks, dispatch_mode)` for auto/sync/batch.
+3. Add `dispatch` parameter to the MLD entrypoint (sync | batch | auto).
+4. Self-test: 20 generation requests via batch produces results
+   structurally identical to 20 synchronous requests for the same
+   inputs (semantic identity not required — model nondeterminism —
+   just structural identity of returned shape and custom_id mapping).
+      ]]></objective>
+
+      <specification><![CDATA[
+**Files to create:**
+
+- /project/pidgin/pipeline/__init__.py — empty marker.
+- /project/pidgin/pipeline/batch.py — generation batch path.
+- /project/pidgin/pipeline/mld.py — moved/copied from
+  tools/mld/pipeline.py with provenance comment AND a new `dispatch`
+  parameter. M10 will reconcile import sites; for this mission, the
+  v0.1 pipeline.py stays in place and pidgin/pipeline/mld.py is the
+  canonical version.
+
+**Dataclasses:**
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    custom_id: str         # e.g. "embed_for_store:call=2:draft=N/A" — N/A because three-draft is in one call
+    cached_preamble: str   # the prompt's cached prefix (XML up to CACHE BOUNDARY)
+    payload: str           # the variable XML payload + output_schema
+    model: str             # "gpt-4.1-nano"
+    max_tokens: int = 500  # soft budget
+    response_format: dict | None = None  # OpenAI json_schema body, or None
+
+@dataclass(frozen=True)
+class GenerationResult:
+    custom_id: str
+    drafts: list[str]      # the three drafts parsed from the response
+    raw_response: dict     # the full Choice/Message dict from OpenAI
+    error: str | None      # None on success
+```
+
+**Build JSONL:**
+
+```python
+def build_jsonl(requests: list[GenerationRequest]) -> str:
+    """Returns the JSONL body (one /v1/chat/completions task per line)."""
+```
+
+Each line:
+```json
+{"custom_id": "...", "method": "POST", "url": "/v1/chat/completions",
+ "body": {"model": "...", "messages": [{"role":"system","content":"<preamble>"},
+                                        {"role":"user","content":"<payload>"}],
+          "max_tokens": 500, "response_format": {...}}}
+```
+
+The cached-preamble vs payload split goes into separate `messages`
+array entries — system message gets the cached preamble (cacheable),
+user message gets the payload. This is what enables prompt-caching
+hits across the batch.
+
+**should_use_batch:**
+
+```python
+def should_use_batch(n_tasks: int, dispatch: Literal["auto","sync","batch"]) -> bool:
+    if dispatch == "sync": return False
+    if dispatch == "batch": return True
+    return n_tasks >= 10  # DP4 default
+```
+
+**run_batch_generation:**
+
+```python
+def run_batch_generation(
+    requests: list[GenerationRequest],
+    *,
+    poll_interval_seconds: float = 5.0,
+    timeout_seconds: float = 1800.0,  # 30 min
+    api_client = None,                 # default: openai.OpenAI() from utils.api
+) -> list[GenerationResult]:
+    """Upload, submit, poll, parse. Returns one result per input request,
+    in input order. Errored tasks have GenerationResult.error set."""
+```
+
+Behaviour:
+1. Build JSONL string.
+2. Upload via `client.files.create(file=BytesIO(jsonl), purpose="batch")`.
+3. Submit via `client.batches.create(input_file_id=..., endpoint="/v1/chat/completions", completion_window="24h")`.
+4. Poll `client.batches.retrieve(batch_id)` until status in
+   {"completed", "failed", "expired", "cancelled"}.
+5. On completed: download `output_file_id`, parse line-by-line.
+6. Map `custom_id` → response → drafts (parse the three-draft JSON
+   from `choices[0].message.content`, accepting four shapes:
+   - `{"draft_1": "...", "draft_2": "...", "draft_3": "..."}`
+   - `{"drafts": ["...", "...", "..."]}`
+   - `["...", "...", "..."]`
+   - bare string with three `\n\n`-separated drafts (legacy/fallback))
+7. Errored entries (custom_id appears in `error_file_id`): populate
+   `error` field, leave `drafts=[]`.
+
+**parse_batch_results:**
+
+```python
+def parse_batch_results(
+    output_jsonl: str,
+    error_jsonl: str | None,
+    requested_ids: list[str],
+) -> list[GenerationResult]: ...
+```
+
+Returns one result per `requested_ids`, in that order. Missing ids
+become a GenerationResult with `error="missing_from_batch_output"`.
+
+**dispatch parameter wiring:**
+
+In /project/pidgin/pipeline/mld.py, the top-level `mld()` function
+gains `dispatch: Literal["auto","sync","batch"] = "auto"`. The
+function internally calls `should_use_batch` to decide. The synchronous
+path is preserved unchanged; the batch path calls
+`run_batch_generation` and adapts the results into the same data
+structure the synchronous path returns.
+
+**Provenance comment** (top of mld.py):
+
+```python
+# pidgin v0.2 — extracted from tools/mld/pipeline.py (v0.1).
+# Behaviour change vs v0.1: `dispatch` parameter added; auto-threshold
+# selects sync (n<10) or batch (n>=10). The convergence math is
+# unchanged — sync and batch paths produce identical downstream shape.
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m6 && cp /project/tools/mld/pipeline.py /tmp/m6/pipeline.py.bak 2>/dev/null || echo BAK_MISSING`
+FAIL: SOFT  (v0.1 pipeline.py may live elsewhere; M10 reconciles)
+
+Step 2. RUN: `find /project/tools -name 'pipeline.py' -path '*mld*' 2>/dev/null | head -3`
+EXPECT MATCHES: pipeline.py
+FAIL: SOFT  (locate v0.1 source for the provenance comment;
+              if not found, document and proceed)
+
+Step 3. Read /project/tools/utils/api.py. Note the OpenAI client
+construction (api key env var, base url, etc.) so batch.py reuses
+the same client convention.
+FAIL: SOFT
+
+**Phase 1 — Write**
+
+Step 4. Write /project/pidgin/pipeline/__init__.py (empty marker with
+provenance line).
+FAIL: HARD
+
+Step 5. Write /project/pidgin/pipeline/batch.py per the specification.
+FAIL: HARD
+
+Step 6. Write /project/pidgin/pipeline/mld.py — copy of v0.1
+pipeline.py with the provenance header, `dispatch` parameter added to
+`mld()`, and the auto-route to `run_batch_generation` when
+`should_use_batch` returns True.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 7. RUN: `python -c "from pidgin.pipeline.batch import GenerationRequest, build_jsonl, should_use_batch, run_batch_generation; print('ok')"`
+(cwd /project)
+EXPECT CONTAINS: ok
+FAIL: HARD
+
+Step 8. RUN: `python -c "
+from pidgin.pipeline.batch import should_use_batch
+assert should_use_batch(5, 'auto') == False
+assert should_use_batch(10, 'auto') == True
+assert should_use_batch(50, 'auto') == True
+assert should_use_batch(1, 'batch') == True
+assert should_use_batch(100, 'sync') == False
+print('threshold_ok')
+"`
+EXPECT CONTAINS: threshold_ok
+FAIL: HARD
+
+Step 9. RUN: `python -c "
+from pidgin.pipeline.batch import GenerationRequest, build_jsonl
+import json
+reqs = [GenerationRequest(custom_id=f't{i}', cached_preamble='PRE', payload='PAY', model='gpt-4.1-nano') for i in range(3)]
+body = build_jsonl(reqs)
+lines = body.strip().split('\n')
+assert len(lines) == 3
+parsed = [json.loads(l) for l in lines]
+assert all(p['url'] == '/v1/chat/completions' for p in parsed)
+assert all(p['body']['model'] == 'gpt-4.1-nano' for p in parsed)
+# Cached preamble in system message, payload in user message:
+assert parsed[0]['body']['messages'][0]['role'] == 'system'
+assert parsed[0]['body']['messages'][0]['content'] == 'PRE'
+assert parsed[0]['body']['messages'][1]['role'] == 'user'
+assert parsed[0]['body']['messages'][1]['content'] == 'PAY'
+print('jsonl_ok')
+"`
+EXPECT CONTAINS: jsonl_ok
+FAIL: HARD
+
+Step 10. Write /tmp/m6/test_parse.py — exercises `parse_batch_results`
+against four synthetic output shapes (dict/drafts/list/bare-string),
+plus the missing-id and errored-id paths. Each case asserts the
+parsed `drafts` list shape and `error` field.
+FAIL: HARD
+
+Step 11. RUN: `python /tmp/m6/test_parse.py`
+EXPECT CONTAINS: PASS
+FAIL: HARD
+
+Step 12. End-to-end live batch test (only if OPENAI_API_KEY is set;
+otherwise SKIP and record reason). Write /tmp/m6/test_live_batch.py
+that submits 20 trivial generation requests via run_batch_generation,
+waits for completion, and asserts:
+  - exactly 20 GenerationResult returned in input order
+  - error field is None for all (or document any errors)
+  - each drafts list has length 3 (or document the shape encountered)
+FAIL: SOFT  (live test failure does NOT fail the mission; document
+             the failure and the architect decides — batch may be
+             unavailable in the executor's environment)
+
+Step 13. RUN: `if [ -n "$OPENAI_API_KEY" ]; then python /tmp/m6/test_live_batch.py 2>&1 | tee /tmp/m6/live.log; else echo SKIPPED_NO_KEY; fi`
+EXPECT MATCHES: (PASS|SKIPPED_NO_KEY)
+FAIL: SOFT
+
+**Phase 3 — Documentation**
+
+Step 14. Write /project/pidgin/pipeline/CLAUDE.md — discovery index
+listing batch.py and mld.py with function tables.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 15. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 6 Report
+
+**Status:** GREEN | RED
+**Files written:** list with sizes
+**Files modified:** none in /project/tools/ (M10 reconciles imports later)
+
+### Step Results
+Per the template.
+
+### Live Batch Result
+- Was OPENAI_API_KEY set? yes/no
+- Wall time from submit → completed (if run)
+- 20 results returned? errored count?
+- Cost reported by OpenAI for the batch (if available)
+- Estimated savings vs synchronous (if computable)
+
+### Key Observations
+- Which response shape did the live model emit? (dict-with-keys,
+  drafts-array, bare-list, or string-with-blanklines?)
+- Did the model honour json_schema response_format under batch?
+  v0.1 used response_format under sync; verify it works under batch.
+
+### Anomalies
+- Any deviation from the spec to make the OpenAI client work in batch
+  mode (file upload size limits, JSONL formatting quirks).
+
+### Risks
+- (HIGH) Polling timeout default is 30 min; large batches may need
+  longer windows. Verify the completion_window="24h" matches the
+  poll timeout semantics.
+- (HIGH) The cached preamble lives in the SYSTEM message — verify
+  OpenAI's prompt-cache eligibility rules apply to system messages
+  for batch endpoint. If not, caching benefit is forfeited.
+- (MED) parse_batch_results' four-shape fallback may mask a bug
+  where the spec contract drifts; consider tightening to one shape
+  in v0.3.
+- (LOW) custom_id naming convention should be documented for
+  downstream consumers.
+
+### Rollback
+`rm -rf /project/pidgin/pipeline`. v0.1 pipeline.py untouched in
+/project/tools/.
+      ]]></report>
+    </mission>
+
+    <mission n="7" tier="execute" review="true">
+      <context><![CDATA[
+M6 added the GENERATION batch path. batch-dispatch.md specifies the
+two-round-trip pattern: generation batch → embedding batch → local
+geometry. This mission adds the embedding batch path so the full MLD
+pipeline can run via batch end-to-end. Decision 6 fixes the embedding
+model and dimension: OpenAI text-embedding-3-small at 256 dimensions.
+Both ephemeral MLD geometry vectors and stored nest vectors use the
+same model — there is exactly one embedding provider in v0.2.
+
+The convergence math (antipode test, cosine similarity, centroid)
+runs locally on returned vectors. No API call needed for that step.
+This mission also extracts the geometry helpers from tools/mld/probe.py
+into pidgin/pipeline/geometry.py so the batch path can call them.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Extend /project/pidgin/pipeline/batch.py with the EMBEDDING batch
+   path: build_embedding_jsonl, run_batch_embedding,
+   parse_embedding_results.
+2. Extract geometry helpers (antipode_test, cosine_similarity,
+   centroid) into /project/pidgin/pipeline/geometry.py.
+3. Provide a `run_embedding_mld_pipeline_for_functions(...)` end-to-end
+   helper that takes a list of functions and runs the full
+   generation-batch → embedding-batch → local-geometry sequence.
+4. Self-test: full pipeline on 5 functions via batch returns
+   convergence ratios structurally compatible with synchronous
+   (each function: ratio in [0, 15], cluster_size in [0, 15]).
+5. Audit: every embedding call uses text-embedding-3-small @ 256 dim
+   (Decision 6). Hard-fail if any code path uses a different model
+   or dimension.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Files to create or extend:**
+
+- EXTEND /project/pidgin/pipeline/batch.py — add embedding path.
+- CREATE /project/pidgin/pipeline/geometry.py — provenance:
+  tools/mld/probe.py (or tools/utils/sections.py — wherever v0.1
+  parks the geometry math).
+
+**Embedding constants (Decision 6):**
+
+In /project/pidgin/utils/api.py (extended in this mission if not
+already present), expose:
+
+```python
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIM = 256
+```
+
+These are the ONLY values used. If any caller tries to override,
+log a warning and force them back. The `embed_for_store()` helper
+must read these constants — not accept them as parameters.
+
+**Embedding batch dataclasses:**
+
+```python
+@dataclass(frozen=True)
+class EmbeddingRequest:
+    custom_id: str         # e.g. "embed_for_store:call=2:cand=1"
+    text: str              # the candidate string to embed
+
+@dataclass(frozen=True)
+class EmbeddingResult:
+    custom_id: str
+    vector: list[float] | None   # length 256, or None on error
+    error: str | None
+```
+
+**build_embedding_jsonl:**
+
+```python
+def build_embedding_jsonl(requests: list[EmbeddingRequest]) -> str: ...
+```
+
+Each line:
+```json
+{"custom_id": "...", "method": "POST", "url": "/v1/embeddings",
+ "body": {"model": "text-embedding-3-small", "input": "...",
+          "dimensions": 256, "encoding_format": "float"}}
+```
+
+**run_batch_embedding:**
+
+```python
+def run_batch_embedding(
+    requests: list[EmbeddingRequest],
+    *,
+    poll_interval_seconds: float = 5.0,
+    timeout_seconds: float = 1800.0,
+    api_client = None,
+) -> list[EmbeddingResult]: ...
+```
+
+Same upload/submit/poll/parse mechanics as run_batch_generation
+but against the `/v1/embeddings` endpoint.
+
+**parse_embedding_results:**
+
+```python
+def parse_embedding_results(
+    output_jsonl: str,
+    error_jsonl: str | None,
+    requested_ids: list[str],
+) -> list[EmbeddingResult]: ...
+```
+
+Four supported response shapes (mirrors M6's tolerance):
+- `{"data":[{"embedding":[...]}]}`
+- `{"embedding":[...]}`
+- `[...]` (bare vector)
+- top-level dict with vector under `vector` key
+
+If returned vector dimension != 256: error="wrong_dim:<N>".
+
+**geometry.py:**
+
+```python
+def cosine_similarity(a: list[float], b: list[float]) -> float: ...
+def centroid(vectors: list[list[float]]) -> list[float]: ...
+def antipode_test(
+    vectors: list[list[float]],
+    *,
+    threshold: float = 0.0,    # cosine sim ≥ 0.0 within cluster
+) -> tuple[int, list[int]]:
+    """Returns (cluster_size, cluster_indices). The dominant cluster
+    is the largest set of vectors mutually above threshold to the
+    cluster centroid. Reproduces v0.1 logic in tools/mld/probe.py."""
+```
+
+Numpy is acceptable; the function may convert lists to np arrays
+internally and return python types.
+
+**End-to-end batch helper:**
+
+```python
+@dataclass(frozen=True)
+class FunctionMldResult:
+    name: str
+    candidates: list[str]               # the 15 candidate descriptions
+    vectors: list[list[float] | None]   # length 15, parallel
+    cluster_size: int                   # antipode result
+    converged: bool                     # cluster_size >= 8 (default rule)
+
+def run_embedding_mld_pipeline_for_functions(
+    functions: list[dict],   # [{"name": ..., "file": ..., "body": ...}, ...]
+    *,
+    converge_template: str = "/project/pidgin/prompts/converge.xml",
+    n_calls: int = 5,
+    dispatch: Literal["auto","sync","batch"] = "auto",
+) -> list[FunctionMldResult]: ...
+```
+
+Pipeline:
+1. For each function, build n_calls GenerationRequests using
+   templates.assemble_xml_prompt(converge_template, payload_vars).
+2. run_batch_generation if should_use_batch(n_total, dispatch).
+3. Flatten draft outputs to candidate strings (n_calls * 3 = 15 per fn).
+4. Build EmbeddingRequests for all candidates.
+5. run_batch_embedding.
+6. Group vectors by function, run antipode_test, populate
+   FunctionMldResult.
+
+**Synchronous fallback:**
+
+If `should_use_batch` returns False, the same helper must still work
+by routing through the synchronous path (loop calling the v0.1-style
+sync API). The convergence math at step 6 is identical.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m7 && cp /project/tools/mld/probe.py /tmp/m7/probe.py.bak 2>/dev/null || cp /project/tools/utils/sections.py /tmp/m7/sections.py.bak 2>/dev/null || echo NO_BAK`
+FAIL: SOFT
+
+Step 2. Read /project/tools/utils/api.py to confirm `embed_for_store`
+exists and to capture the dimension constant currently in use. If
+it's not 256, document and fix in M10 (out of scope here).
+FAIL: SOFT
+
+Step 3. RUN: `grep -rE 'dimensions=[0-9]+|EMBEDDING_DIM' /project/tools /project/pidgin 2>/dev/null | head -10`
+FAIL: SOFT  (audit current values; report them)
+
+**Phase 1 — Write**
+
+Step 4. Edit /project/pidgin/utils/api.py (create if missing) to
+declare EMBEDDING_MODEL and EMBEDDING_DIM constants AND a
+`get_openai_client()` factory that reuses the v0.1 client.
+Provenance comment if extracted.
+FAIL: HARD
+
+Step 5. Write /project/pidgin/pipeline/geometry.py per the spec.
+FAIL: HARD
+
+Step 6. Edit /project/pidgin/pipeline/batch.py to add EmbeddingRequest,
+EmbeddingResult, build_embedding_jsonl, run_batch_embedding,
+parse_embedding_results, and run_embedding_mld_pipeline_for_functions.
+Re-export from /project/pidgin/pipeline/__init__.py.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 7. RUN: `python -c "
+from pidgin.utils.api import EMBEDDING_MODEL, EMBEDDING_DIM
+assert EMBEDDING_MODEL == 'text-embedding-3-small', EMBEDDING_MODEL
+assert EMBEDDING_DIM == 256, EMBEDDING_DIM
+print('decision6_ok')
+"`
+EXPECT CONTAINS: decision6_ok
+FAIL: HARD
+
+Step 8. RUN: `python -c "
+from pidgin.pipeline import EmbeddingRequest, build_embedding_jsonl
+import json
+reqs = [EmbeddingRequest(custom_id=f'e{i}', text=f'sample {i}') for i in range(3)]
+body = build_embedding_jsonl(reqs)
+parsed = [json.loads(l) for l in body.strip().split('\n')]
+assert all(p['url'] == '/v1/embeddings' for p in parsed)
+assert all(p['body']['model'] == 'text-embedding-3-small' for p in parsed)
+assert all(p['body']['dimensions'] == 256 for p in parsed)
+print('embed_jsonl_ok')
+"`
+EXPECT CONTAINS: embed_jsonl_ok
+FAIL: HARD
+
+Step 9. RUN: `python -c "
+from pidgin.pipeline.geometry import cosine_similarity, centroid, antipode_test
+v1 = [1.0, 0.0, 0.0]
+v2 = [0.99, 0.01, 0.0]
+v3 = [0.0, 1.0, 0.0]
+sim12 = cosine_similarity(v1, v2)
+sim13 = cosine_similarity(v1, v3)
+assert sim12 > 0.99, sim12
+assert abs(sim13) < 0.01, sim13
+size, idx = antipode_test([v1, v2, v3])
+assert size == 2, (size, idx)  # v1 and v2 cluster, v3 antipode
+print('geometry_ok')
+"`
+EXPECT CONTAINS: geometry_ok
+FAIL: HARD
+
+Step 10. Write /tmp/m7/test_pipeline.py — runs
+run_embedding_mld_pipeline_for_functions on 5 trivial functions
+(use simple Python identity / arithmetic functions inline) with
+dispatch="batch" if OPENAI_API_KEY is present, else dispatch="sync".
+Assert:
+  - 5 FunctionMldResult returned
+  - Each has 15 candidates and 15 vectors (or documented errors)
+  - Each cluster_size in [0, 15]
+  - converged is True iff cluster_size >= 8
+FAIL: HARD
+
+Step 11. RUN: `if [ -n "$OPENAI_API_KEY" ]; then python /tmp/m7/test_pipeline.py 2>&1 | tee /tmp/m7/pipeline.log; else echo SKIPPED_NO_KEY; fi`
+EXPECT MATCHES: (PASS|SKIPPED_NO_KEY)
+FAIL: SOFT  (treat live failures as architect-review, not RED)
+
+**Phase 3 — Documentation**
+
+Step 12. Edit /project/pidgin/pipeline/CLAUDE.md to add geometry.py,
+embedding batch surface, and the end-to-end helper.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 13. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 7 Report
+
+**Status:** GREEN | RED
+**Files written:** list with sizes
+**Files modified:** /project/pidgin/utils/api.py,
+                    /project/pidgin/pipeline/__init__.py,
+                    /project/pidgin/pipeline/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Decision 6 Audit
+- EMBEDDING_MODEL value: <...>
+- EMBEDDING_DIM value: <...>
+- Any code paths in /project still using a different model or dim?
+  Quote them — they need fixing in M10.
+
+### Live Pipeline Result
+- Mode used (batch / sync)
+- Per-function: candidate count, vector count, cluster size, converged
+- Total wall time
+- Total cost (estimate or reported)
+
+### Key Observations
+- Did the geometry results match v0.1 antipode_test conventions?
+- Was there any drift in cluster_size between sync and batch on the
+  same input? (Should be zero — same math.)
+
+### Anomalies
+- Response shape encountered for embeddings (which of the four supported)
+- Any vector dimension mismatch (wrong_dim errors)
+
+### Risks
+- (HIGH) Decision 6 enforcement is policy-only at present; a
+  determined caller can bypass the constants. M10 should add a
+  module-level assertion that embed_for_store ignores override args.
+- (HIGH) antipode_test default threshold (0.0) may be too lenient
+  for the 256-dim space — v0.1 used a specific threshold; verify
+  parity in the report.
+- (MED) Two-round-trip pattern means the embedding batch can complete
+  long after the generation batch — the helper must persist the
+  generation results to disk so a poll-loss doesn't lose work
+  (out of scope for this mission, flag for v0.3).
+- (LOW) `dispatch="auto"` makes the batch decision per-call; users
+  who set up a 100-function batch may get surprised when a 9-function
+  retry goes synchronous.
+
+### Rollback
+Revert /project/pidgin/utils/api.py and /project/pidgin/pipeline/batch.py
+to M6 state; `rm /project/pidgin/pipeline/geometry.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="8" tier="execute" review="true">
+      <context><![CDATA[
+v0.1 ran a fixed 5 calls × 3 drafts = 15 candidates per probe with no
+expansion logic. v2-founding-record.md notes that 4/4 v2 probes were
+5/5 — but the 3/5 case (marginal convergence) was never empirically
+exercised because v2 didn't track the ratio. adaptive-candidates.md
+specifies the policy:
+
+- 5/5 or 4/5 (strict ratio ≥ 0.8): accept.
+- 3/5 (strict ratio == 0.6): generate 5 more calls (15 more candidates),
+  retest against the full 30, accept if cluster ≥ 7/10 (strict ratio
+  ≥ 0.7) on the expanded set, else flag non-convergent.
+- Below 3/5: flag non-convergent immediately.
+
+This mission integrates the policy into pidgin/pipeline/candidates.py
+as a loop around the existing convergence test. v0.2 must also TRACK
+ratios (not just converged/not-converged) so empirical data on
+expansion frequency accumulates from this mission onward.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement /project/pidgin/pipeline/candidates.py with
+   `evaluate_with_expansion(...)` and the supporting dataclass.
+2. Configurable thresholds (defaults from adaptive-candidates.md);
+   reject misconfiguration at construction.
+3. Track convergence ratios per evaluation in a JSONL log at
+   /project/.pidgin/audit/convergence.jsonl.
+4. Self-test two named scenarios:
+   - A: initial cluster [True,True,True,False,False] (3/5), target 0.7
+     on expanded set → expansion triggered, expanded result decides.
+   - B: initial cluster [True]*7 + [False]*3 (7/10) — N/A as
+     initial because we test 5-call seed; instead use [True,True,
+     True,True,False] (4/5) → no expansion, accept.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to create:**
+
+- /project/pidgin/pipeline/candidates.py
+  Provenance: NEW — adaptive-candidates.md.
+
+**Dataclasses:**
+
+```python
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass(frozen=True)
+class ExpansionConfig:
+    accept_ratio: float = 0.8       # initial 4/5 or 5/5 → accept
+    expand_ratio: float = 0.6       # initial 3/5 → expand
+    expanded_accept_ratio: float = 0.7  # after expansion: 7/10 → accept
+    initial_n_calls: int = 5
+    expansion_n_calls: int = 5
+    drafts_per_call: int = 3
+    # Strict comparison: ratio >= threshold accepts.
+
+@dataclass(frozen=True)
+class CandidateEvaluation:
+    function_name: str
+    initial_ratio: float            # cluster_size / n_candidates_initial
+    expanded: bool                  # whether expansion ran
+    expanded_ratio: float | None    # cluster_size / n_candidates_total after expansion
+    converged: bool                 # final verdict
+    n_candidates_total: int         # 15 normally, 30 after expansion
+    cluster_size: int               # final cluster size
+    candidates: list[str]           # all candidates (for downstream selection)
+    vectors: list[list[float] | None]
+```
+
+**Construction:**
+
+```python
+def __post_init__(self):  # on ExpansionConfig
+    if not (0.0 < self.expand_ratio <= self.accept_ratio <= 1.0):
+        raise ValueError("expand_ratio must be in (0, accept_ratio]")
+    if not (0.0 < self.expanded_accept_ratio <= 1.0):
+        raise ValueError("expanded_accept_ratio must be in (0, 1]")
+    if self.initial_n_calls < 1 or self.expansion_n_calls < 1:
+        raise ValueError("call counts must be >= 1")
+```
+
+**The evaluator:**
+
+```python
+def evaluate_with_expansion(
+    function_name: str,
+    *,
+    generate_fn: Callable[[int], tuple[list[str], list[list[float]|None]]],
+        # generate_fn(n_calls) → (candidates, vectors). Implementations
+        # may dispatch to batch or sync internally.
+    cluster_fn: Callable[[list[list[float]|None]], int],
+        # cluster_fn(vectors) → cluster_size (use geometry.antipode_test
+        # adapted to return only the size).
+    config: ExpansionConfig = ExpansionConfig(),
+    *,
+    audit_path: str = "/project/.pidgin/audit/convergence.jsonl",
+) -> CandidateEvaluation: ...
+```
+
+Behaviour:
+1. cands_initial, vecs_initial = generate_fn(config.initial_n_calls)
+2. cluster_initial = cluster_fn(vecs_initial)
+3. ratio_initial = cluster_initial / len(cands_initial)
+4. Branches:
+   - ratio_initial >= accept_ratio:
+       converged = True; expanded = False; record + return.
+   - expand_ratio <= ratio_initial < accept_ratio:
+       cands_more, vecs_more = generate_fn(config.expansion_n_calls)
+       cands_all = cands_initial + cands_more
+       vecs_all = vecs_initial + vecs_more
+       cluster_expanded = cluster_fn(vecs_all)
+       ratio_expanded = cluster_expanded / len(cands_all)
+       converged = ratio_expanded >= expanded_accept_ratio
+       expanded = True; record + return.
+   - ratio_initial < expand_ratio:
+       converged = False; expanded = False; record + return.
+
+**Audit JSONL line:**
+
+```json
+{"timestamp": "...", "function": "embed_for_store",
+ "initial_ratio": 0.6, "expanded": true,
+ "expanded_ratio": 0.7333,
+ "converged": true, "cluster_size": 22,
+ "n_candidates_total": 30}
+```
+
+Tracking the ratio (not just converged/not-converged) is the
+deliberate v0.2 upgrade — empirical data on expansion frequency
+accumulates from here.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m8`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `test -f /project/pidgin/pipeline/geometry.py`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (M7 must have run)
+
+**Phase 1 — Write**
+
+Step 3. Write /project/pidgin/pipeline/candidates.py per spec.
+FAIL: HARD
+
+Step 4. Edit /project/pidgin/pipeline/__init__.py to export
+`ExpansionConfig`, `CandidateEvaluation`, `evaluate_with_expansion`.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 5. RUN: `python -c "
+from pidgin.pipeline import ExpansionConfig
+try:
+    ExpansionConfig(accept_ratio=0.5, expand_ratio=0.6)  # invalid: expand > accept
+    print('FAIL_NO_RAISE')
+except ValueError as e:
+    print('CONFIG_VALIDATED:', e)
+"`
+EXPECT CONTAINS: CONFIG_VALIDATED
+FAIL: HARD
+
+Step 6. Write /tmp/m8/test_scenarios.py:
+
+```python
+import sys, os, tempfile, json
+sys.path.insert(0, "/project")
+from pidgin.pipeline import ExpansionConfig, evaluate_with_expansion
+
+# Scenario A: initial 3/5, expansion brings it to 8/10 (>= 0.7) → converged.
+calls = {"n": 0}
+def gen_A(n):
+    calls["n"] += 1
+    if calls["n"] == 1:
+        # 5 calls × 3 drafts = 15 candidates; cluster = 9 (3/5 ratio)
+        cands = [f"c{i}" for i in range(15)]
+        # Vectors: 9 in cluster (near [1,0,0]), 6 antipodal (near [-1,0,0])
+        vecs = [[1.0, 0.0, 0.0]] * 9 + [[-1.0, 0.0, 0.0]] * 6
+        return cands, vecs
+    else:
+        # Expansion: 5 more calls = 15 more candidates; 12 in cluster
+        cands = [f"c{i+15}" for i in range(15)]
+        vecs = [[1.0, 0.0, 0.0]] * 12 + [[-1.0, 0.0, 0.0]] * 3
+        return cands, vecs
+
+def cluster_A(vecs):
+    # Count near [1,0,0]
+    return sum(1 for v in vecs if v and v[0] > 0.5)
+
+with tempfile.TemporaryDirectory() as d:
+    audit = os.path.join(d, "conv.jsonl")
+    res = evaluate_with_expansion("fA", generate_fn=gen_A, cluster_fn=cluster_A, audit_path=audit)
+    assert res.expanded, "scenario A should expand"
+    # initial: 9/15 = 0.6 (== expand_ratio); expanded: 21/30 = 0.7 (== expanded_accept_ratio)
+    assert res.converged, f"scenario A should converge after expansion: {res}"
+    assert res.n_candidates_total == 30
+    line = open(audit).read().strip()
+    entry = json.loads(line)
+    assert entry["expanded"] is True
+    print("A_PASS")
+
+# Scenario B: initial 4/5 → no expansion, accept.
+calls["n"] = 0
+def gen_B(n):
+    calls["n"] += 1
+    cands = [f"c{i}" for i in range(15)]
+    # 12 in cluster = 4/5 ratio
+    vecs = [[1.0, 0.0, 0.0]] * 12 + [[-1.0, 0.0, 0.0]] * 3
+    return cands, vecs
+
+def cluster_B(vecs):
+    return sum(1 for v in vecs if v and v[0] > 0.5)
+
+with tempfile.TemporaryDirectory() as d:
+    audit = os.path.join(d, "conv.jsonl")
+    res = evaluate_with_expansion("fB", generate_fn=gen_B, cluster_fn=cluster_B, audit_path=audit)
+    assert not res.expanded, "scenario B should NOT expand"
+    assert res.converged, "scenario B should converge initially"
+    assert calls["n"] == 1, f"should have generated once, got {calls['n']}"
+    print("B_PASS")
+
+# Scenario C: initial 2/5 → no expansion, non-convergent.
+calls["n"] = 0
+def gen_C(n):
+    calls["n"] += 1
+    cands = [f"c{i}" for i in range(15)]
+    vecs = [[1.0, 0.0, 0.0]] * 6 + [[-1.0, 0.0, 0.0]] * 9  # 6/15 = 0.4
+    return cands, vecs
+
+def cluster_C(vecs):
+    return max(
+        sum(1 for v in vecs if v and v[0] > 0.5),
+        sum(1 for v in vecs if v and v[0] < -0.5),
+    )
+
+with tempfile.TemporaryDirectory() as d:
+    audit = os.path.join(d, "conv.jsonl")
+    res = evaluate_with_expansion("fC", generate_fn=gen_C, cluster_fn=cluster_C, audit_path=audit)
+    # cluster_C returns 9, ratio = 9/15 = 0.6 → would expand. To get a true "below expand",
+    # use a cluster_fn that picks the minority. Adjust:
+    # Re-evaluate with explicit "strict below expand_ratio" data:
+    pass
+
+# Real Scenario C: cluster size 5/15 = 0.333 < 0.6
+calls["n"] = 0
+def gen_C2(n):
+    calls["n"] += 1
+    cands = [f"c{i}" for i in range(15)]
+    vecs = [[1.0, 0.0, 0.0]] * 5 + [[-1.0, 0.0, 0.0]] * 10
+    return cands, vecs
+
+def cluster_C2(vecs):
+    return sum(1 for v in vecs if v and v[0] > 0.5)
+
+with tempfile.TemporaryDirectory() as d:
+    audit = os.path.join(d, "conv.jsonl")
+    res = evaluate_with_expansion("fC2", generate_fn=gen_C2, cluster_fn=cluster_C2, audit_path=audit)
+    assert not res.expanded, "scenario C2 should NOT expand (below expand_ratio)"
+    assert not res.converged, "scenario C2 should be non-convergent"
+    print("C_PASS")
+
+print("ALL_PASS")
+```
+
+FAIL: HARD
+
+Step 7. RUN: `python /tmp/m8/test_scenarios.py`
+EXPECT CONTAINS: ALL_PASS
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 8. Edit /project/pidgin/pipeline/CLAUDE.md to add the candidates.py
+entry: thresholds, ratio-tracking purpose.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 9. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 8 Report
+
+**Status:** GREEN | RED
+**Files written:** /project/pidgin/pipeline/candidates.py
+**Files modified:** /project/pidgin/pipeline/__init__.py,
+                    /project/pidgin/pipeline/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Threshold Settings
+- accept_ratio: 0.8
+- expand_ratio: 0.6
+- expanded_accept_ratio: 0.7
+Confirm these match adaptive-candidates.md.
+
+### Self-Test Output
+Paste stdout from /tmp/m8/test_scenarios.py.
+
+### Key Observations
+- Audit JSONL format chosen (paste one entry).
+- generate_fn / cluster_fn injection design — note any trade-offs
+  vs hardcoded calls into geometry.antipode_test.
+
+### Anomalies
+- Floating-point comparison edge cases (e.g. 9/15 == 0.6 exactly?
+  Verify the strict `>=` does what the spec requires).
+
+### Risks
+- (HIGH) The expansion call may double cost on borderline functions;
+  audit JSONL becomes essential to validate the trigger frequency
+  is acceptable in M14/M15 probes.
+- (MED) Threshold tuning is design-time; v0.2 has no automatic
+  adjustment loop. Note for v0.3.
+- (LOW) generate_fn is invoked twice on expansion paths but caller
+  may not realise this; document the contract.
+
+### Rollback
+`rm /project/pidgin/pipeline/candidates.py` and revert
+/project/pidgin/pipeline/__init__.py.
+      ]]></report>
+    </mission>
+
+    <mission n="9" tier="execute" review="true">
+      <context><![CDATA[
+batch-dispatch.md specifies that Anthropic's Message Batches API
+follows the same pattern as OpenAI's: identical preambles + varying
+payloads, batched for cost discount and rate-limit isolation. v0.1
+used Anthropic models for two call types: gate verdicts and the
+Opus selection call (when the candidate set is ambiguous). The Opus
+selection call is the most expensive per-call operation; batching
+it across functions is the highest-leverage Anthropic batch use case.
+
+This mission adds the Anthropic batch path to pidgin/pipeline/batch.py
+(reusing as much of the OpenAI infrastructure as makes sense without
+forcing a misshapen abstraction). M11 (CLI) will route gate calls
+through this path when count exceeds the threshold.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement Anthropic Message Batches integration:
+   AnthropicBatchRequest, build_anthropic_batch_body,
+   run_anthropic_batch, parse_anthropic_batch_results.
+2. Auto-threshold reuses `should_use_batch` from M6.
+3. Self-test: 10 gate calls dispatched via Anthropic batch return
+   results structurally identical to 10 synchronous gate calls.
+4. Document the cost differential observed (sync vs batch) if a
+   live key is available.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File extended:**
+
+- /project/pidgin/pipeline/batch.py — Anthropic section added.
+
+**Dataclasses:**
+
+```python
+@dataclass(frozen=True)
+class AnthropicBatchRequest:
+    custom_id: str
+    cached_preamble: str   # placed in system block with cache_control
+    payload: str           # placed in user message
+    model: str             # e.g. "claude-haiku-4-5-20251001" for gate,
+                           #      "claude-opus-4-7" for selection
+    max_tokens: int = 256
+    response_schema: dict | None = None  # if set, enforce structured output
+
+@dataclass(frozen=True)
+class AnthropicBatchResult:
+    custom_id: str
+    text: str | None       # the model's response text
+    parsed: dict | None    # if response_schema set, the parsed JSON
+    raw_response: dict
+    error: str | None
+```
+
+**run_anthropic_batch:**
+
+```python
+def run_anthropic_batch(
+    requests: list[AnthropicBatchRequest],
+    *,
+    poll_interval_seconds: float = 5.0,
+    timeout_seconds: float = 1800.0,
+    api_client = None,
+) -> list[AnthropicBatchResult]: ...
+```
+
+Behaviour:
+1. Build the messages array per Anthropic Batches API:
+   `requests=[{"custom_id": "...", "params": {"model": "...",
+              "max_tokens": ..., "system": [{"type":"text","text":"<preamble>",
+              "cache_control":{"type":"ephemeral"}}],
+              "messages": [{"role":"user","content":"<payload>"}]}}, ...]`
+2. Submit via `client.messages.batches.create(requests=...)`.
+3. Poll `client.messages.batches.retrieve(batch_id)` until
+   processing_status in {"ended", "canceling", "expired"}.
+4. Stream results via `client.messages.batches.results(batch_id)`,
+   yielding (custom_id, result_obj) pairs.
+5. For each result: extract first content block's text; if
+   response_schema was set, attempt JSON parse and store in `parsed`.
+
+**Cache control:**
+
+The cached_preamble lives in the system block with
+`cache_control: {"type": "ephemeral"}` — Anthropic's prompt cache
+syntax. Identical preambles across the batch should hit cache after
+the first request (within a 5-minute window).
+
+**Reuse vs duplication:**
+
+- Threshold logic (`should_use_batch`) is shared.
+- Polling loop pattern is similar but the API surfaces differ enough
+  (Anthropic uses `messages.batches.results` streaming vs OpenAI's
+  file download) that a single abstraction would be premature.
+  Keep two parallel implementations; revisit in v0.3 if the duplication
+  becomes painful.
+
+**Synchronous fallback:**
+
+When `should_use_batch` returns False, callers route through the
+existing v0.1 synchronous Anthropic path (already in tools/utils/api.py
+or wherever v0.1 keeps it). This mission does NOT add a new sync
+path — only the batch path.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m9`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. Read /project/tools/utils/api.py to confirm Anthropic client
+construction conventions; reuse them.
+FAIL: SOFT
+
+Step 3. RUN: `python -c "import anthropic; print(anthropic.__version__)"`
+EXPECT MATCHES: ^[0-9]+
+FAIL: HARD  (anthropic SDK must be installed; if missing, install
+             before continuing)
+
+**Phase 1 — Write**
+
+Step 4. Edit /project/pidgin/pipeline/batch.py to add the Anthropic
+classes and functions per spec, and re-export from
+/project/pidgin/pipeline/__init__.py.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 5. RUN: `python -c "
+from pidgin.pipeline import AnthropicBatchRequest, run_anthropic_batch, AnthropicBatchResult
+print('imports_ok')
+"`
+EXPECT CONTAINS: imports_ok
+FAIL: HARD
+
+Step 6. Write /tmp/m9/test_live_anthropic.py — submits 10 gate-style
+requests (using gate.xml as the preamble and trivial candidates) via
+run_anthropic_batch, asserts:
+  - exactly 10 results returned in input order
+  - error is None for all (or document)
+  - parsed dict has `valid` key when response_schema was supplied
+FAIL: HARD
+
+Step 7. RUN: `if [ -n "$ANTHROPIC_API_KEY" ]; then python /tmp/m9/test_live_anthropic.py 2>&1 | tee /tmp/m9/live.log; else echo SKIPPED_NO_KEY; fi`
+EXPECT MATCHES: (PASS|SKIPPED_NO_KEY)
+FAIL: SOFT  (live failure → architect review)
+
+**Phase 3 — Documentation**
+
+Step 8. Edit /project/pidgin/pipeline/CLAUDE.md to add the Anthropic
+batch surface table.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 9. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 9 Report
+
+**Status:** GREEN | RED
+**Files written:** none (extended existing batch.py)
+**Files modified:** /project/pidgin/pipeline/batch.py,
+                    /project/pidgin/pipeline/__init__.py,
+                    /project/pidgin/pipeline/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Live Anthropic Batch Result
+- ANTHROPIC_API_KEY set? yes/no
+- Wall time, error count, structured-output parse success rate
+- Cost reported (if available); estimated savings vs sync
+
+### Cache Control Audit
+- Confirm system block carries `cache_control: ephemeral`.
+- If cache hits not observed (first batch always misses), note for
+  empirical follow-up post-sprint.
+
+### Anomalies
+- API surface differences between SDK versions encountered
+- Any retries / rate-limit hits
+
+### Risks
+- (HIGH) Anthropic's batch result streaming uses a different polling
+  surface than OpenAI's file download; the parallel implementations
+  may drift over time. Document the divergence so M11 routes correctly.
+- (MED) Cache hits require identical preambles within a 5-minute window;
+  if M11 invokes the gate sporadically, cache benefit may not
+  materialise.
+- (MED) The 256-token max_tokens default for gate may be too tight if
+  reason text grows; revisit empirically.
+- (LOW) parse_anthropic_batch_results' tolerance for malformed JSON
+  may mask schema-violation bugs in the gate prompt.
+
+### Rollback
+Revert /project/pidgin/pipeline/batch.py to its M7 state.
+      ]]></report>
+    </mission>
+
+    <mission n="10" tier="execute" review="true">
+      <context><![CDATA[
+M1-M9 added pidgin/ subpackages (write/, prompts/, pipeline/, utils/)
+in their final layout per DP1. v0.1 source still lives at /project/tools/.
+This mission is the reconciliation step:
+
+1. Audit which v0.1 files have been functionally extracted into
+   pidgin/ vs which still need to move (sections.py / vectors.py
+   merge into pidgin/store/nest.py per design Architecture/Pidgin
+   Package Structure section).
+2. Move the remaining structurally-clean code with provenance comments.
+3. Verify all v0.1 tests pass against the new import paths.
+4. Establish the public API in pidgin/__init__.py.
+
+This mission is execution-tier rather than reason because the moves
+are mechanical and the decisions were made in the design's Pidgin
+Package Structure section. Anything ambiguous is escalated.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Inventory: list every v0.1 source file under /project/tools/, mark
+   each as MOVED, EXTRACTED-PARTIAL, RETAINED-V01, or DEAD.
+2. Move the remaining-to-move files:
+   - tools/store/sections_chroma.py + tools/store/vectors.py →
+     /project/pidgin/store/nest.py (merged, per Architecture).
+   - tools/store/audit.py → /project/pidgin/store/audit.py (refactored
+     so M2's transaction context lives in pidgin/write/update.py and
+     audit.py becomes the JSONL helper only).
+   - tools/utils/parser.py → /project/pidgin/utils/parser.py.
+3. Re-export the public API from /project/pidgin/__init__.py:
+   `from .write import artifact_write, compress_write, update`
+   `from .prompts import assemble_xml_prompt`
+   `from .pipeline import run_embedding_mld_pipeline_for_functions`
+   `from .store import nest, audit`
+4. Verify: every existing test under /project/tools/tests (or wherever
+   v0.1 keeps tests) passes when import paths are updated.
+5. Self-test: every file in pidgin/ has a provenance comment OR is a
+   __init__.py marker.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Inventory format (write to /tmp/m10/inventory.tsv):**
+
+```
+v0.1_path                                   status              new_path                                   notes
+/project/tools/store/audit.py               EXTRACTED-PARTIAL   /project/pidgin/store/audit.py             M2 took transaction context; remaining content moves here
+/project/tools/store/sections_chroma.py     MOVED               /project/pidgin/store/nest.py              merged with vectors.py
+/project/tools/store/vectors.py             MOVED               /project/pidgin/store/nest.py              merged with sections_chroma.py
+/project/tools/utils/api.py                 EXTRACTED-PARTIAL   /project/pidgin/utils/api.py               M7 added EMBEDDING_MODEL/DIM
+/project/tools/utils/parser.py              MOVED               /project/pidgin/utils/parser.py
+/project/tools/utils/sections.py            EXTRACTED-PARTIAL   /project/pidgin/pipeline/geometry.py + audit?  geometry done in M7
+/project/tools/mld/pipeline.py              MOVED               /project/pidgin/pipeline/mld.py            M6 already copied
+/project/tools/mld/probe.py                 EXTRACTED-PARTIAL   /project/pidgin/pipeline/geometry.py        M7 took the math
+/project/tools/prompts/generate.md          MIGRATED            /project/pidgin/prompts/converge.xml        M3
+/project/tools/prompts/validate.md          MIGRATED            /project/pidgin/prompts/gate.xml            M4
+```
+
+**Files to create/extend:**
+
+- /project/pidgin/store/__init__.py — re-exports nest + audit.
+- /project/pidgin/store/nest.py — merged sections_chroma + vectors,
+  with provenance pointing at both v0.1 sources.
+- /project/pidgin/store/audit.py — JSONL helpers extracted from v0.1
+  audit.py; transaction code lives in pidgin/write/update.py per M2.
+- /project/pidgin/utils/parser.py — moved AST extraction.
+- /project/pidgin/__init__.py — top-level public API per Objective 3.
+
+**Provenance comment audit:**
+
+Every .py file in /project/pidgin/ (except __init__.py markers) must
+contain `# pidgin v0.2` and either `# Provenance:` (extracted) or
+`# NEW.` (new in v0.2) within the first 10 lines.
+
+**Test re-routing:**
+
+If /project/tools/tests/ exists, copy each test file to
+/project/pidgin/tests/ and replace `from tools.X` imports with
+`from pidgin.X` (mapping per the inventory). Run all tests; report
+the count passed/failed.
+
+If no v0.1 tests exist (note: design says "all existing v0.1 tests
+pass against the new import paths" — if there are no existing tests,
+say so clearly and skip; this is NOT a HARD failure).
+
+**v0.1 source disposition:**
+
+Do NOT delete /project/tools/ files in this mission. M11 (CLI) needs
+none of them; the deletion is a separate cleanup pass. Document the
+deletion candidates in the report but leave the files in place for
+this mission's safety.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m10 && find /project/tools -type f \( -name '*.py' -o -name '*.md' \) | sort > /tmp/m10/v01_files.txt && wc -l /tmp/m10/v01_files.txt`
+EXPECT MATCHES: ^[[:space:]]*[0-9]+
+FAIL: HARD
+
+Step 2. RUN: `find /project/pidgin -type f -name '*.py' | sort > /tmp/m10/v02_files.txt && wc -l /tmp/m10/v02_files.txt`
+EXPECT MATCHES: ^[[:space:]]*[0-9]+
+FAIL: HARD
+
+Step 3. Read /project/tools/store/sections_chroma.py and
+/project/tools/store/vectors.py. Note their public surfaces and
+which functions belong to the merged nest.py.
+FAIL: SOFT
+
+**Phase 1 — Write**
+
+Step 4. Write /tmp/m10/inventory.tsv per the spec format. One row per
+v0.1 source file.
+FAIL: HARD
+
+Step 5. Write /project/pidgin/store/__init__.py and
+/project/pidgin/store/nest.py (merged, with provenance).
+FAIL: HARD
+
+Step 6. Write /project/pidgin/store/audit.py (JSONL helpers extracted;
+NOT the transaction code which lives in pidgin/write/update.py).
+FAIL: HARD
+
+Step 7. Write /project/pidgin/utils/parser.py (move from
+/project/tools/utils/parser.py with provenance comment).
+FAIL: HARD
+
+Step 8. Edit /project/pidgin/__init__.py to add the top-level public
+API re-exports per Objective 3, preserving the existing version /
+license header.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 9. RUN: `python -c "
+from pidgin import (
+    artifact_write, compress_write, update,
+    assemble_xml_prompt,
+)
+from pidgin.pipeline import run_embedding_mld_pipeline_for_functions
+from pidgin.store import nest, audit
+from pidgin.utils import parser, api
+print('public_api_ok')
+"`
+(cwd /project)
+EXPECT CONTAINS: public_api_ok
+FAIL: HARD
+
+Step 10. RUN: `python -c "
+import os, re
+root = '/project/pidgin'
+missing = []
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        if not f.endswith('.py'): continue
+        p = os.path.join(dp, f)
+        if f == '__init__.py' and os.path.getsize(p) < 200: continue  # markers ok
+        head = open(p).read()[:600]
+        if 'pidgin v0.2' not in head: missing.append(p)
+        elif not ('Provenance' in head or 'NEW.' in head): missing.append(p)
+print('MISSING_PROVENANCE:', len(missing))
+for m in missing: print(' -', m)
+"`
+EXPECT CONTAINS: MISSING_PROVENANCE: 0
+FAIL: SOFT  (a small number is acceptable; document them)
+
+Step 11. RUN: `find /project/pidgin -name 'tests' -type d 2>/dev/null && find /project/tools -name 'tests' -type d 2>/dev/null`
+FAIL: SOFT  (locate any existing test directories)
+
+Step 12. If v0.1 tests exist: re-route imports and run them.
+RUN: `if [ -d /project/tools/tests ]; then \
+        cp -r /project/tools/tests /project/pidgin/tests && \
+        find /project/pidgin/tests -name '*.py' -exec sed -i.bak 's/from tools\./from pidgin./g; s/import tools\./import pidgin./g' {} \; && \
+        cd /project && python -m pytest pidgin/tests -x 2>&1 | tail -30; \
+      else echo NO_V01_TESTS; fi`
+EXPECT MATCHES: (passed|NO_V01_TESTS)
+FAIL: SOFT
+
+**Phase 3 — Documentation**
+
+Step 13. Write /project/pidgin/CLAUDE.md — top-level discovery index
+listing every subpackage with a one-line DOES column and the public
+API surface from __init__.py.
+FAIL: HARD
+
+Step 14. Write /project/pidgin/store/CLAUDE.md — discovery index for
+nest.py + audit.py.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 15. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 10 Report
+
+**Status:** GREEN | RED
+**Files written:** list with sizes
+**Files modified:** /project/pidgin/__init__.py and any v0.1 imports
+                    if test rerouting was performed
+
+### Inventory Summary
+| Status | Count | Examples |
+|--------|-------|----------|
+| MOVED | <N> | ... |
+| EXTRACTED-PARTIAL | <N> | ... |
+| RETAINED-V01 | <N> | ... |
+| DEAD | <N> | ... |
+
+Attach /tmp/m10/inventory.tsv contents in full.
+
+### Public API
+List the symbols re-exported from /project/pidgin/__init__.py.
+
+### Provenance Audit
+- Files missing provenance comment: <N>
+- For each, justify (or fix in this mission).
+
+### Test Re-Routing
+- v0.1 tests located? yes/no, where
+- Re-routed import map (one line per package mapping)
+- Tests passed: <N>/<M>
+- Failures (if any): paste the first 5 lines of each failure trace
+
+### Key Observations
+- Did the sections_chroma + vectors merge produce conflicts in
+  function names or schema fields? How resolved?
+- Is the v0.1 audit.py now safe to delete (no remaining importers)?
+  If yes, propose deletion in v0.3.
+
+### Anomalies
+- Any v0.1 file that does not map cleanly into pidgin/?
+- Circular import risks introduced by the public API in __init__.py?
+
+### Risks
+- (HIGH) The sections_chroma + vectors merge is a behavioral
+  consolidation with no test coverage if v0.1 tests are absent.
+  Recommend M14/M15 probes also exercise the nest.py read/write path
+  end-to-end.
+- (HIGH) v0.1 source still in /project/tools/ creates dual import paths;
+  any code using `from tools.X` continues to work and may mask the
+  migration. Note for v0.3 cleanup.
+- (MED) Public API re-exports increase import-time cost slightly;
+  acceptable for v0.2 ergonomics.
+- (LOW) Provenance comment convention is enforced by the audit script,
+  which is itself the only check — operator error is the likely
+  failure mode.
+
+### Rollback
+The mission writes new files and does not delete v0.1 source. Rollback
+is `rm -rf /project/pidgin/store /project/pidgin/utils/parser.py
+/project/pidgin/tests` and revert /project/pidgin/__init__.py to its
+M1 state.
+      ]]></report>
+    </mission>
+
+    <mission n="11" tier="execute" review="true">
+      <context><![CDATA[
+pidgin-architecture.md defines the CLI surface: four primary verbs
+(index, update, new, compress) plus three operational verbs (query,
+init, plus a status/help). Three permission flags: --write-db,
+--write-source. Default is read-only.
+
+This mission stands up cli.py and __main__.py so `python -m pidgin <verb>`
+works. The verbs delegate to the verbs/ subpackage; each verb file is a
+thin glue layer over the pipeline / store / write modules built in
+M1-M10. M12 will populate the .pidgin/nest/ convention; M13 adds the
+nested-nest discovery for `init`.
+
+This mission ships the CLI scaffold + the `index` verb fully wired.
+The other verbs are scaffolded with `argparse` subcommands and stub
+implementations that route to placeholder functions. M12 fills in
+`new`, `compress`, `update` (which is mostly Transaction wrap from
+M2), and `query`. M13 fills in `init`.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement /project/pidgin/__main__.py and /project/pidgin/cli.py.
+2. Argparse subcommands for: index, update, new, compress, query, init.
+3. Permission flags: --write-db, --write-source (additive, independent).
+4. The `index` verb is FULLY wired: walks the target directory, extracts
+   public functions via pidgin.utils.parser, runs the MLD pipeline,
+   stores results in .pidgin/nest/ (when --write-db is set).
+5. Other verbs raise NotImplementedError with a clear message naming
+   the mission that will fill them in (M12 for new/compress/update/query;
+   M13 for init).
+6. Self-test: `python -m pidgin --help` prints the verb list;
+   `python -m pidgin index /tmp/m11/sample --write-db` indexes a
+   trivial sample directory without errors.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Files to create:**
+
+- /project/pidgin/__main__.py — entry point: `from .cli import main; main()`.
+- /project/pidgin/cli.py — argparse + verb dispatch.
+- /project/pidgin/verbs/__init__.py — verb registry.
+- /project/pidgin/verbs/index.py — fully wired.
+- /project/pidgin/verbs/update.py — stub (delegates to pidgin.write.update
+  context manager; mostly a CLI wrapper).
+- /project/pidgin/verbs/new.py — stub.
+- /project/pidgin/verbs/compress.py — stub.
+- /project/pidgin/verbs/query.py — stub.
+- /project/pidgin/verbs/init.py — stub.
+
+**CLI structure:**
+
+```
+pidgin <verb> [verb-args] [--write-db] [--write-source] [--sync] [--batch]
+
+Verbs:
+  index <path>                  Read source, extract functions, run MLD pipeline.
+                                  --write-db required to persist to .pidgin/nest/.
+  update <path>                 Surgical edit on an existing file.
+                                  --write-source required.
+  new <kind> [args]             Generate a new file (origami, architecture, ...).
+                                  --write-source required.
+  compress <input> [-o OUT]     MLD-compress an input file.
+                                  --write-db --write-source required.
+  query <text>                  Search the local nest.
+                                  Read-only.
+  init                          Discover and register nested .pidgin/nest/ dirs.
+                                  Read-only by default; --write-db to persist registry.
+```
+
+**cli.py structure:**
+
+```python
+import argparse, sys
+from .verbs import index, update, new, compress, query, init
+
+VERBS = {
+    "index": index.run,
+    "update": update.run,
+    "new": new.run,
+    "compress": compress.run,
+    "query": query.run,
+    "init": init.run,
+}
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="pidgin", description="...")
+    p.add_argument("--write-db", action="store_true",
+                   help="Permit writes to the local nest (ChromaDB).")
+    p.add_argument("--write-source", action="store_true",
+                   help="Permit writes to source files.")
+    p.add_argument("--sync", action="store_true",
+                   help="Force synchronous dispatch (no batch).")
+    p.add_argument("--batch", action="store_true",
+                   help="Force batch dispatch.")
+    sub = p.add_subparsers(dest="verb", required=True)
+    # index
+    pi = sub.add_parser("index", help="Index a repository path.")
+    pi.add_argument("path", help="Target directory or file.")
+    # update
+    pu = sub.add_parser("update", help="Surgical edit.")
+    pu.add_argument("path")
+    pu.add_argument("--edits-file",
+                   help="JSONL file describing edits (interactive prompt otherwise).")
+    # new / compress / query / init similarly
+    ...
+    return p
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return VERBS[args.verb](args)
+```
+
+**index verb (full wire):**
+
+```python
+# pidgin/verbs/index.py
+def run(args) -> int:
+    from pidgin.utils.parser import extract_public_functions
+    from pidgin.pipeline import run_embedding_mld_pipeline_for_functions
+    from pidgin.store import nest
+
+    if not args.write_db:
+        print("[dry-run] Re-run with --write-db to persist to .pidgin/nest/")
+    funcs = extract_public_functions(args.path)
+    print(f"[index] Discovered {len(funcs)} public functions in {args.path}")
+    if not funcs: return 0
+
+    dispatch = "batch" if args.batch else ("sync" if args.sync else "auto")
+    results = run_embedding_mld_pipeline_for_functions(funcs, dispatch=dispatch)
+    converged = sum(1 for r in results if r.converged)
+    print(f"[index] Converged: {converged}/{len(results)}")
+
+    if args.write_db:
+        nest.upsert_function_descriptions(args.path, results)
+        print(f"[index] Wrote nest at {args.path}/.pidgin/nest/")
+    return 0
+```
+
+`nest.upsert_function_descriptions` may need to be added to nest.py
+in this mission if M10 didn't include it (it's M10's `nest.py` after
+all). If the function is missing, add it here with a provenance pointer
+to v0.1's `section_put`.
+
+**Stub verbs:**
+
+```python
+def run(args) -> int:
+    raise NotImplementedError(
+        "pidgin <verb> is not yet wired. Filled in by mission M12."
+    )
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m11/sample && cat > /tmp/m11/sample/sample.py <<'PY'
+def add(a, b):
+    """Return the sum of a and b."""
+    return a + b
+
+def echo(x):
+    return x
+PY`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `test -f /project/pidgin/utils/parser.py`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (M10 must have run)
+
+**Phase 1 — Write**
+
+Step 3. Write /project/pidgin/verbs/__init__.py.
+FAIL: HARD
+
+Step 4. Write /project/pidgin/verbs/index.py per spec (fully wired).
+FAIL: HARD
+
+Step 5. Write the stub verbs: update.py, new.py, compress.py,
+query.py, init.py — each raising NotImplementedError with the
+mission-named message.
+FAIL: HARD
+
+Step 6. Write /project/pidgin/cli.py per spec.
+FAIL: HARD
+
+Step 7. Write /project/pidgin/__main__.py:
+
+```python
+from .cli import main
+import sys
+sys.exit(main())
+```
+
+FAIL: HARD
+
+Step 8. If pidgin/store/nest.py lacks `upsert_function_descriptions`,
+add it with a clear function signature and a v0.1 provenance pointer.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 9. RUN: `cd /project && python -m pidgin --help 2>&1 | head -20`
+EXPECT CONTAINS: index
+FAIL: HARD
+
+Step 10. RUN: `cd /project && python -m pidgin --help 2>&1 | grep -E '(index|update|new|compress|query|init)' | wc -l`
+EXPECT MATCHES: ^[[:space:]]*([6-9]|[1-9][0-9])
+FAIL: HARD
+
+Step 11. RUN: `cd /project && python -m pidgin index /tmp/m11/sample 2>&1 | head -10`
+EXPECT CONTAINS: dry-run
+FAIL: HARD
+
+Step 12. RUN: `cd /project && python -m pidgin index /tmp/m11/sample --write-db --sync 2>&1 | tee /tmp/m11/index.log; echo EXIT=$?`
+EXPECT MATCHES: EXIT=0
+FAIL: SOFT  (the live MLD path may fail without API key; if so,
+             document and re-run with --sync after setting the key —
+             the CLI plumbing is what this mission verifies)
+
+Step 13. RUN: `cd /project && python -m pidgin update /tmp/m11/sample/sample.py --write-source 2>&1 | head -5`
+EXPECT CONTAINS: NotImplementedError
+FAIL: SOFT  (stub verbs must surface NotImplementedError clearly)
+
+Step 14. RUN: `cd /project && python -m pidgin query "anything" 2>&1 | head -5`
+EXPECT CONTAINS: NotImplementedError
+FAIL: SOFT
+
+**Phase 3 — Documentation**
+
+Step 15. Write /project/pidgin/cli.py docstring + write
+/project/pidgin/verbs/CLAUDE.md — discovery index per verb with
+implemented/stub status.
+FAIL: SOFT
+
+Step 16. Edit /project/pidgin/CLAUDE.md (M10) to add the CLI section:
+verb table, flag table, entry point.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 17. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 11 Report
+
+**Status:** GREEN | RED
+**Files written:** cli.py, __main__.py, verbs/* (6 files)
+**Files modified:** /project/pidgin/CLAUDE.md,
+                    possibly /project/pidgin/store/nest.py
+
+### Step Results
+Per the template.
+
+### CLI Surface
+Paste `python -m pidgin --help` output (truncated to 30 lines).
+
+### Live Index Test
+- Did `pidgin index /tmp/m11/sample --write-db --sync` complete?
+- Functions discovered: <N>
+- Convergence ratio reported
+- Was .pidgin/nest/ created at /tmp/m11/sample/?
+
+### Stub Coverage
+List the stub verbs that raised NotImplementedError as expected.
+
+### Anomalies
+- Any verb where the stub leaks an unrelated error before raising
+  NotImplementedError (signals an import-time bug).
+- Argparse defaults that may surprise users (e.g. --batch when
+  --sync also set — current behaviour: ?)
+
+### Risks
+- (HIGH) The CLI is the main user surface — argparse misconfiguration
+  (e.g. flag conflicts, missing required args) will surface as
+  cryptic errors. Consider adding M11b smoke-test mission for v0.3.
+- (MED) `index` writing to .pidgin/nest/ requires M12's nest convention
+  to be in place; this mission's --write-db path may fail until M12
+  completes. Verify the failure message is helpful.
+- (MED) `--sync` and `--batch` both set: the current behaviour is
+  ambiguous; document or reject in build_parser.
+- (LOW) NotImplementedError is fine for stubs but exit code is 1
+  (Python default); some shells treat that as failure — verify the
+  CLI exit code semantics in the report.
+
+### Rollback
+`rm -rf /project/pidgin/cli.py /project/pidgin/__main__.py
+/project/pidgin/verbs` and revert /project/pidgin/CLAUDE.md.
+      ]]></report>
+    </mission>
+
+    <mission n="12" tier="execute" review="true">
+      <context><![CDATA[
+pidgin-architecture.md fixes the store convention: `.pidgin/nest/` at
+the target repo root contains ChromaDB persistent storage;
+`.pidgin/CLAUDE.md` is auto-generated by `pidgin index` and teaches
+agents how to query the store. Both can be committed (Roboflow ships
+pre-indexed repos) or gitignored — no configuration needed for either
+mode.
+
+This mission also fills in three of the stub verbs from M11: `new`,
+`compress`, `update`. Each is a thin CLI wrapper over the M1/M2/M5
+primitives. `query` becomes operable too — it queries the local nest
+(no nested-nest aggregation; that is M13).
+      ]]></context>
+
+      <objective><![CDATA[
+1. Establish the .pidgin/nest/ store path: pidgin/store/nest.py
+   resolves it from the target repo root with no config.
+2. Auto-generate /project/.pidgin/CLAUDE.md when `index` runs with
+   --write-db (and the file does not already exist).
+3. Wire the stubs: new, compress, update, query.
+4. Self-test: `pidgin index /tmp/m12/sample --write-db` creates
+   .pidgin/nest/ AND .pidgin/CLAUDE.md;
+   `pidgin query "what does add do"` returns the indexed
+   description for `add()`.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Nest path resolution:**
+
+```python
+# pidgin/store/nest.py
+def nest_path(repo_root: str) -> str:
+    return os.path.join(repo_root, ".pidgin", "nest")
+
+def ensure_nest(repo_root: str) -> str:
+    path = nest_path(repo_root)
+    os.makedirs(path, exist_ok=True)
+    return path
+```
+
+`repo_root` is the operator-supplied path to `pidgin index`. No
+auto-discovery in this mission (M13 does that for nested nests).
+
+**.pidgin/CLAUDE.md auto-generation:**
+
+```python
+# pidgin/store/nest.py
+def write_nest_claude_md(repo_root: str, *, force: bool = False) -> str:
+    path = os.path.join(repo_root, ".pidgin", "CLAUDE.md")
+    if os.path.exists(path) and not force:
+        return path  # do not overwrite operator edits
+    content = NEST_CLAUDE_MD_TEMPLATE
+    with open(path, "w") as f:
+        f.write(content)
+    return path
+
+NEST_CLAUDE_MD_TEMPLATE = """\
+# .pidgin/
+
+This directory is the Pidgin nest for this repository.
+
+- `nest/` — ChromaDB persistent store. Function descriptions, module
+  summaries, behavioural contracts. Generated by `pidgin index`.
+- `CLAUDE.md` — this file. Tells agents how to query the nest.
+
+## Querying
+
+```
+pidgin query "what handles retry"
+```
+
+Returns the highest-similarity function descriptions from the nest.
+The query is embedded with text-embedding-3-small @ 256 dim and
+matched by cosine similarity.
+
+## Re-Indexing
+
+```
+pidgin index . --write-db
+```
+
+Re-runs the MLD pipeline against current source. Existing nest entries
+are upserted by file path + function name.
+
+## Provenance
+
+This file is auto-generated by `pidgin index`. Edit freely; the
+generator will not overwrite an existing file.
+"""
+```
+
+**Verb wiring:**
+
+- /project/pidgin/verbs/new.py — `new <kind>`. Initial kinds:
+  `origami`, `architecture`, `claude-md`. Each routes to a generator
+  function in pidgin/write/new.py that produces the file content via
+  the MLD pipeline (compression direction). Uses `artifact_write`.
+  Requires --write-source.
+- /project/pidgin/verbs/compress.py — `compress <input> [-o OUT]`.
+  Reads the input, runs MLD-compress, writes to OUT (default:
+  `<input>.compressed.md`). Uses `compress_write`. Requires
+  --write-db AND --write-source.
+- /project/pidgin/verbs/update.py — `update <path> --edits-file FILE`.
+  Reads the edits file (JSONL, one EditOp per line), opens
+  pidgin.write.update(path), queues each op, exits the context.
+  Requires --write-source. (Interactive mode without --edits-file is
+  out of scope for v0.2; raise a clear error.)
+- /project/pidgin/verbs/query.py — `query <text>`. Embeds the query,
+  searches the local nest at `<cwd>/.pidgin/nest/`, prints top 5
+  results with cosine similarity. Read-only. Falls back to "(no nest
+  found at <path>)" if missing.
+
+**Permission enforcement:**
+
+CLI checks: if a verb requires --write-db / --write-source and the
+flag is not set, exit with a clear error: "pidgin <verb>: refusing
+to <action> without --write-db. Re-run with --write-db." Exit code 2.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m12/sample && cat > /tmp/m12/sample/lib.py <<'PY'
+def add(a, b):
+    """Return the sum of a and b."""
+    return a + b
+
+def divide(a, b):
+    """Divide a by b. Raises ZeroDivisionError if b is 0."""
+    return a / b
+PY`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `test -f /project/pidgin/cli.py -a -f /project/pidgin/verbs/index.py`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (M11 must have run)
+
+**Phase 1 — Write**
+
+Step 3. Edit /project/pidgin/store/nest.py to add `nest_path`,
+`ensure_nest`, `write_nest_claude_md`, and `NEST_CLAUDE_MD_TEMPLATE`.
+FAIL: HARD
+
+Step 4. Edit /project/pidgin/verbs/index.py to call `ensure_nest` +
+`write_nest_claude_md` when --write-db is set.
+FAIL: HARD
+
+Step 5. Replace stub /project/pidgin/verbs/new.py per spec.
+FAIL: HARD
+
+Step 6. Replace stub /project/pidgin/verbs/compress.py per spec.
+FAIL: HARD
+
+Step 7. Replace stub /project/pidgin/verbs/update.py per spec.
+FAIL: HARD
+
+Step 8. Replace stub /project/pidgin/verbs/query.py per spec.
+FAIL: HARD
+
+Step 9. Edit /project/pidgin/cli.py to enforce permission flags per
+spec (exit 2 with the prescribed error message).
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 10. RUN: `cd /project && python -m pidgin index /tmp/m12/sample --write-db --sync 2>&1 | tee /tmp/m12/index.log; echo EXIT=$?`
+EXPECT MATCHES: EXIT=0
+FAIL: SOFT  (live API may be unavailable; document if so)
+
+Step 11. RUN: `test -d /tmp/m12/sample/.pidgin/nest -a -f /tmp/m12/sample/.pidgin/CLAUDE.md`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (this is the structural assertion — directories must exist
+             even if the live MLD pipeline failed, IF index ran far
+             enough to create them; if step 10 SOFT-failed pre-creation,
+             create the structure manually for the test then SOFT-fail
+             this step too)
+
+Step 12. RUN: `head -20 /tmp/m12/sample/.pidgin/CLAUDE.md`
+EXPECT CONTAINS: pidgin query
+FAIL: HARD
+
+Step 13. RUN: `cd /tmp/m12/sample && python -m pidgin query "sum two numbers" 2>&1 | head -10`
+EXPECT MATCHES: (add|no nest found)
+FAIL: SOFT
+
+Step 14. RUN: `cd /project && python -m pidgin compress /tmp/m12/sample/lib.py 2>&1 | head -5`
+EXPECT CONTAINS: --write-source
+FAIL: HARD  (permission enforcement)
+
+Step 15. RUN: `cd /project && python -m pidgin compress /tmp/m12/sample/lib.py --write-db --write-source -o /tmp/m12/lib.compressed.md 2>&1; test -f /tmp/m12/lib.compressed.md && echo COMPRESSED_OK || echo COMPRESSED_FAIL`
+EXPECT MATCHES: (COMPRESSED_OK|COMPRESSED_FAIL)
+FAIL: SOFT  (live API path; structural is what matters)
+
+**Phase 3 — Documentation**
+
+Step 16. Edit /project/pidgin/verbs/CLAUDE.md to flip the four newly-
+wired verbs from "stub" to "wired".
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 17. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 12 Report
+
+**Status:** GREEN | RED
+**Files written:** none new (all wires were existing files)
+**Files modified:** nest.py, verbs/index.py, verbs/new.py,
+                    verbs/compress.py, verbs/update.py, verbs/query.py,
+                    cli.py, verbs/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Nest Convention Check
+- `.pidgin/nest/` created at sample path: yes/no
+- `.pidgin/CLAUDE.md` content first 5 lines:
+- ChromaDB files visible at .pidgin/nest/ (sqlite3 / parquet)?
+
+### Permission Enforcement Audit
+- compress without --write-source: error message verbatim
+- new without --write-source: error message verbatim
+- update without --write-source: error message verbatim
+- index without --write-db: dry-run output verbatim
+
+### Live Pipeline Result
+If the live API was available, paste the index summary and the
+query result.
+
+### Anomalies
+- Any verb where permission enforcement leaked the wrong message.
+- Compressed output destination handling (-o flag semantics).
+
+### Risks
+- (HIGH) `query` reads the nest by `<cwd>/.pidgin/nest/`. If the
+  user's cwd differs from the indexed repo root, results are silently
+  empty. M13's nested-nest discovery ameliorates but does not fix —
+  document the cwd dependency.
+- (MED) Compress's default output filename `<input>.compressed.md`
+  may collide with existing files; should it require -o? Defer
+  decision to operator review.
+- (MED) update verb's --edits-file requirement is heavy for casual
+  use; v0.3 might add an interactive mode.
+- (LOW) The auto-generated CLAUDE.md is overwritten only with --force;
+  document this so operators know to delete the file if they want a
+  refreshed template.
+
+### Rollback
+`rm -rf /tmp/m12 && cd /project && git checkout -- pidgin/store/nest.py
+pidgin/verbs/ pidgin/cli.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="13" tier="execute" review="true">
+      <context><![CDATA[
+pidgin-architecture.md describes nested-nest discovery: a parent repo
+containing sub-repos (fe-toolkit containing watchtower, switchboard,
+marionette) can register child `.pidgin/nest/` dirs at `pidgin init`,
+and a query with namespace `.` searches all of them.
+
+This mission ships pidgin/store/discovery.py and wires the `init` verb.
+After M13, all six CLI verbs are operable; the package is functionally
+complete.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement /project/pidgin/store/discovery.py with
+   `discover_nests(root)` and `register_nests(root, nests)`.
+2. Wire pidgin/verbs/init.py: discover, persist registry to
+   /project/<root>/.pidgin/registry.json, print summary.
+3. Extend pidgin/verbs/query.py: when invoked from a root with a
+   registry, search all registered nests; merge and rank results.
+4. Self-test: create two child repos with sample nests, run
+   `pidgin init` at the parent, verify the registry lists both,
+   run `pidgin query` and verify results from BOTH children.
+      ]]></objective>
+
+      <specification><![CDATA[
+**discovery.py:**
+
+```python
+@dataclass(frozen=True)
+class NestPointer:
+    repo_root: str          # absolute path to the child repo root
+    nest_path: str          # absolute path to .pidgin/nest/
+    namespace: str          # default: basename(repo_root); overridable
+
+def discover_nests(
+    root: str,
+    *,
+    max_depth: int = 4,
+    follow_symlinks: bool = False,
+) -> list[NestPointer]: ...
+```
+
+Behaviour:
+- Walk `root` up to max_depth.
+- A directory is a "nest holder" if it contains `.pidgin/nest/` AND
+  is NOT `root` itself (we don't register the parent as a child of
+  itself).
+- Skip standard noise: `.git/`, `node_modules/`, `__pycache__/`,
+  `.venv/`, `venv/`, `.pidgin/` (don't recurse into a found nest).
+- Return one NestPointer per discovered nest.
+
+```python
+def register_nests(
+    root: str,
+    nests: list[NestPointer],
+) -> str:
+    """Write JSON registry to <root>/.pidgin/registry.json. Return path."""
+```
+
+JSON shape:
+
+```json
+{
+  "version": 1,
+  "root": "/abs/path/to/parent",
+  "registered_at": "2026-04-26T...",
+  "nests": [
+    {"repo_root": "/abs/.../watchtower", "nest_path": "/abs/.../watchtower/.pidgin/nest",
+     "namespace": "watchtower"},
+    ...
+  ]
+}
+```
+
+```python
+def load_registry(root: str) -> list[NestPointer] | None: ...
+```
+
+**verbs/init.py:**
+
+```python
+def run(args) -> int:
+    from pidgin.store import discovery
+    root = os.path.abspath(args.path or os.getcwd())
+    nests = discovery.discover_nests(root)
+    print(f"[init] Discovered {len(nests)} nested nest(s) under {root}")
+    for n in nests:
+        print(f"  - {n.namespace} → {n.nest_path}")
+    if not nests:
+        print("[init] No child nests found.")
+        return 0
+    if args.write_db:
+        path = discovery.register_nests(root, nests)
+        print(f"[init] Registry persisted at {path}")
+    else:
+        print("[init] Re-run with --write-db to persist the registry.")
+    return 0
+```
+
+**verbs/query.py extension:**
+
+```python
+def run(args) -> int:
+    from pidgin.store import nest as nest_mod, discovery
+    cwd = os.getcwd()
+    registry = discovery.load_registry(cwd)
+    targets = []
+    if registry:
+        targets = [(p.namespace, p.nest_path) for p in registry]
+        print(f"[query] Searching {len(targets)} registered nest(s).")
+    else:
+        local = os.path.join(cwd, ".pidgin", "nest")
+        if not os.path.isdir(local):
+            print(f"[query] No nest at {local} and no registry found.")
+            return 0
+        targets = [("local", local)]
+
+    results = []
+    for ns, path in targets:
+        for hit in nest_mod.query(path, args.text, top_k=5):
+            results.append((ns, hit))
+    # Sort by similarity descending, take top 10 across all nests:
+    results.sort(key=lambda r: -r[1].similarity)
+    for ns, hit in results[:10]:
+        print(f"  [{ns}] {hit.similarity:.3f}  {hit.function_name}  "
+              f"({hit.file}:{hit.line_start})")
+        print(f"      {hit.description}")
+    return 0
+```
+
+`nest_mod.query` may need to be added to nest.py if absent; it returns
+NestQueryHit with similarity, function_name, file, line_start,
+description.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /tmp/m13/parent/{child_a,child_b}`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `mkdir -p /tmp/m13/parent/child_a/.pidgin/nest /tmp/m13/parent/child_b/.pidgin/nest && touch /tmp/m13/parent/child_a/.pidgin/nest/chroma.sqlite3 /tmp/m13/parent/child_b/.pidgin/nest/chroma.sqlite3`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+**Phase 1 — Write**
+
+Step 3. Write /project/pidgin/store/discovery.py per spec.
+FAIL: HARD
+
+Step 4. Edit /project/pidgin/verbs/init.py per spec.
+FAIL: HARD
+
+Step 5. Edit /project/pidgin/verbs/query.py to add the registry-aware
+multi-nest query path.
+FAIL: HARD
+
+Step 6. Edit /project/pidgin/cli.py to add `--path` (optional) to the
+init subparser.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 7. RUN: `cd /tmp/m13/parent && python -m pidgin init 2>&1 | tee /tmp/m13/init.log`
+EXPECT CONTAINS: child_a
+FAIL: HARD
+
+Step 8. RUN: `grep -c child_b /tmp/m13/init.log`
+EXPECT MATCHES: ^[1-9]
+FAIL: HARD
+
+Step 9. RUN: `cd /tmp/m13/parent && python -m pidgin init --write-db 2>&1 | grep -i registry`
+EXPECT CONTAINS: registry.json
+FAIL: HARD
+
+Step 10. RUN: `test -f /tmp/m13/parent/.pidgin/registry.json && python -c "import json; d=json.load(open('/tmp/m13/parent/.pidgin/registry.json')); print(len(d['nests']))"`
+EXPECT MATCHES: ^2$
+FAIL: HARD
+
+Step 11. RUN: `cd /tmp/m13/parent && python -m pidgin query "anything" 2>&1 | head -10`
+EXPECT CONTAINS: Searching 2
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 12. Edit /project/pidgin/store/CLAUDE.md to add discovery.py
+entry.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 13. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 13 Report
+
+**Status:** GREEN | RED
+**Files written:** /project/pidgin/store/discovery.py
+**Files modified:** verbs/init.py, verbs/query.py, cli.py,
+                    store/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Discovery Output
+Paste init's stdout for the synthetic parent setup.
+
+### Registry Format
+Paste the registry.json content from /tmp/m13/parent/.pidgin/.
+
+### Multi-Nest Query Result
+Paste query stdout for the synthetic setup; confirm it walked both
+child nests.
+
+### Anomalies
+- Any walk-depth surprises (max_depth=4 too shallow / deep?)
+- Namespace collision handling (two children named the same?)
+
+### Risks
+- (HIGH) Walk skipping `.pidgin/` dirs is the load-bearing safety
+  against infinite recursion when a nest is itself indexed; verify.
+- (MED) Registry persists absolute paths; moving the parent breaks
+  it. Document.
+- (MED) Query merging is naive (top 10 by similarity); per-namespace
+  top-N might be more useful — flag for v0.3.
+- (LOW) follow_symlinks=False default is conservative; some monorepos
+  use symlinks for sub-modules.
+
+### Rollback
+`rm -rf /tmp/m13 && cd /project && git checkout -- pidgin/store/
+pidgin/verbs/init.py pidgin/verbs/query.py pidgin/cli.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="14" tier="reason" review="true">
+      <context><![CDATA[
+bidirectional-mld.md proposes that the MLD convergence geometry works
+in both directions. Code→description is validated (54+4 empirical
+runs across v0 and v0.1). Description→code has zero empirical runs.
+The code embedding space may behave differently than natural
+language — variable names, control flow, formatting create syntactic
+structure that descriptions don't have.
+
+design.md Decision 1 makes this a VALIDATION TARGET: probe data
+decides whether bidirectional MLD is committed (Phase 5 unlocks) or
+deferred to v0.3. NO CODE for sprint-plan-as-artifact is written
+until the gate clears.
+
+This mission is REASON tier because the probe design is a judgment
+call: which functions to probe, which budgets, which embedding
+strategy, what convergence threshold is meaningful in the code
+embedding space. The harness must be defensible; the design choices
+must be documented; the M16 gate decision must rest on data this
+mission collects.
+      ]]></context>
+
+      <objective><![CDATA[
+1. SELECT 5 reference MLD descriptions from v0.1 (the v2-validation
+   functions: embed, main, apply, merge, plus one complex function).
+2. DEFINE the probe parameters: N=10 candidate implementations per
+   description, budget_range=(50, 200) — extremes only per design;
+   embedding model = text-embedding-3-small @ 256 dim (Decision 6).
+3. WRITE the probe harness as
+   /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/harness.py.
+   The harness must be re-runnable by M15 without human intervention.
+4. DOCUMENT every judgment call: probe selection rationale, budget
+   selection rationale, embedding-space caveats, the convergence
+   threshold proposed for the code-embedding-space antipode test
+   (which may differ from the description-space default).
+5. COST: under $1.00 via batch (design Decision 1).
+6. NO live execution in this mission — that is M15. Compose only.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Files to create:**
+
+- /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/
+  - README.md — design rationale, judgment calls, gate criteria.
+  - harness.py — runnable script.
+  - probes.json — the 5 selected probes (description + reference
+    implementation + metadata).
+
+**Probe selection (judgment):**
+
+The 5 probes should span:
+- 1 simple data-flow function (e.g. `embed_for_store` — input → API
+  call → return).
+- 1 control-flow function (e.g. `main` — argv parsing → dispatch).
+- 1 state-mutation function (e.g. `apply` — merge delta into copy
+  of state).
+- 1 numeric/geometric function (e.g. `merge` or `centroid`).
+- 1 deliberately complex function — operator's choice. Document.
+
+Sources for the descriptions:
+- Prefer v0.1 nest entries if available
+  (/project/.pidgin/nest/ from any prior index run).
+- Else use M3's converged outputs at
+  /project/local/sprints/tooling-v0.2/probes/m3-converge-xml/.
+- Else use the descriptions in v2-founding-record.md verbatim.
+
+Document the source per probe in probes.json.
+
+**Probe parameters:**
+
+- N candidates per description: 10 (NOT 15 from compress direction;
+  the geometry of code may need a different sample size — document
+  the choice).
+- Budget range: (50, 200) — extremes only. The middle is least
+  informative when the convergence question is "does it work at all
+  in this space?".
+- Stability runs: 3 repeated runs per (probe, budget) — total 5 × 2 ×
+  3 = 30 runs at N=10 = 300 generation calls.
+- Cost projection: 300 × ~$0.006 = ~$1.80 sync, ~$0.90 batch — under
+  the $1.00 cap if batch is used (which it MUST be at 300 calls).
+
+**Convergence threshold (judgment):**
+
+The description-space default is cluster ≥ 8/15 (~53%). For code
+embedding space, propose: cluster ≥ 6/10 (60%) for "stable", with
+a separate "syntactically valid" check (the code must parse) and a
+"semantically correct vs original" check (operator review of the
+single converged candidate).
+
+Document why these thresholds. The M16 gate will use them.
+
+**Harness shape:**
+
+```python
+# probes/m14-bidirectional/harness.py
+import json, sys, os, ast
+sys.path.insert(0, "/project")
+from pidgin.pipeline import (
+    run_embedding_mld_pipeline_for_functions,
+    ExpansionConfig,
+    evaluate_with_expansion,
+)
+from pidgin.prompts import assemble_xml_prompt
+
+PROBES_PATH = os.path.join(os.path.dirname(__file__), "probes.json")
+RESULTS_PATH = os.path.join(os.path.dirname(__file__), "results.json")
+
+def load_probes() -> list[dict]: ...
+
+def build_expand_template() -> str:
+    """Return path to a description-to-code prompt. Adapt converge.xml
+    or write a sibling expand.xml. Document choice in README.md."""
+
+def run_one_probe(probe: dict, budget: int, run_idx: int) -> dict: ...
+
+def main() -> int:
+    probes = load_probes()
+    results = []
+    for probe in probes:
+        for budget in (50, 200):
+            for run_idx in range(3):
+                results.append(run_one_probe(probe, budget, run_idx))
+    json.dump(results, open(RESULTS_PATH, "w"), indent=2)
+    print(f"[m14] wrote {len(results)} run records to {RESULTS_PATH}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+**Expand template (judgment):**
+
+Description→code is a different generation task than code→description.
+A copy of converge.xml will not give correct results — the role is
+flipped, the rules are different ("produce a syntactically valid
+implementation" instead of "describe the function"), the output schema
+needs to be code, not three drafts.
+
+This mission CREATES /project/pidgin/prompts/expand.xml as a sibling
+to converge.xml. Same XML structure, different role, different rules,
+different output schema. Document the differences in README.md.
+
+**Acceptance for M14 (reason tier):**
+
+- README.md exists, names every judgment call, defends each.
+- harness.py is runnable (imports succeed; main() can be invoked
+  without errors before any API calls happen — i.e. probes load,
+  templates assemble).
+- probes.json has 5 entries with all required fields.
+- expand.xml is well-formed XML.
+- NO API calls made in this mission.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `mkdir -p /project/local/sprints/tooling-v0.2/probes/m14-bidirectional`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. Read /project/pidgin/prompts/converge.xml to understand the
+structural template that expand.xml will mirror.
+FAIL: SOFT
+
+Step 3. Locate description sources:
+RUN: `find /project -path '*/probes/m3-converge-xml/*.json' 2>/dev/null | head -5; test -d /project/.pidgin/nest && echo NEST_PRESENT`
+FAIL: SOFT  (if neither present, fall back to v2-founding-record.md
+              descriptions per spec)
+
+**Phase 1 — Write**
+
+Step 4. Write probes/m14-bidirectional/README.md documenting:
+  - The 5 selected probes with rationale per probe.
+  - Why N=10 (not 15).
+  - Why budget extremes (50, 200) only.
+  - Convergence threshold for the code embedding space (proposed: 6/10
+    cluster + syntactic validity + semantic correctness).
+  - Cost projection.
+  - The gate criteria M16 will apply.
+FAIL: HARD
+
+Step 5. Write probes/m14-bidirectional/probes.json with 5 entries:
+each has {probe_id, function_name, description, source,
+reference_implementation_path, complexity_class}.
+FAIL: HARD
+
+Step 6. Write /project/pidgin/prompts/expand.xml. Mirror converge.xml's
+structure but:
+  - role: "Produce N candidate implementations of the described
+          function. Each candidate must be syntactically valid Python."
+  - rules: include rules forbidding pseudocode, requiring runnable
+           Python, requiring the function signature to match the
+           description.
+  - output_schema: a single field "implementation" (string) per call.
+  - cache boundary marker present.
+FAIL: HARD
+
+Step 7. Write probes/m14-bidirectional/harness.py per spec.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 8. RUN: `python -c "import xml.etree.ElementTree as ET; ET.parse('/project/pidgin/prompts/expand.xml'); print('expand_xml_valid')"`
+EXPECT CONTAINS: expand_xml_valid
+FAIL: HARD
+
+Step 9. RUN: `python -c "
+import json
+p = json.load(open('/project/local/sprints/tooling-v0.2/probes/m14-bidirectional/probes.json'))
+assert len(p) == 5, len(p)
+required = {'probe_id', 'function_name', 'description', 'source', 'complexity_class'}
+for entry in p:
+    missing = required - set(entry.keys())
+    assert not missing, (entry['probe_id'] if 'probe_id' in entry else '?', missing)
+print('probes_json_ok')
+"`
+EXPECT CONTAINS: probes_json_ok
+FAIL: HARD
+
+Step 10. RUN: `python -c "
+import sys
+sys.path.insert(0, '/project')
+sys.path.insert(0, '/project/local/sprints/tooling-v0.2/probes/m14-bidirectional')
+import harness
+probes = harness.load_probes()
+assert len(probes) == 5
+print('harness_loads')
+"`
+EXPECT CONTAINS: harness_loads
+FAIL: HARD
+
+Step 11. RUN: `wc -l /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/README.md`
+EXPECT MATCHES: ^[[:space:]]*[5-9][0-9]
+FAIL: SOFT  (a serious README is at least 50 lines; warn if shorter)
+
+**Phase 3 — Documentation**
+
+Step 12. The README.md IS the documentation; no separate CLAUDE.md
+needed for an under-test probe directory.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 13. Produce the structured report — and as a reason-tier mission,
+include an architectural reasoning section explicitly.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 14 Report
+
+**Status:** GREEN | RED
+**Files written:** README.md, probes.json, harness.py, expand.xml
+
+### Step Results
+Per the template.
+
+### Probe Selection (judgment)
+List the 5 probes with one-line rationale each.
+
+### Parameter Choices (judgment)
+- N=10 because: <reasoning>
+- Budget extremes (50, 200) because: <reasoning>
+- Stability runs = 3 because: <reasoning>
+- Convergence threshold = 6/10 because: <reasoning>
+
+### Expand Template Diff
+Summarise how expand.xml differs from converge.xml: role, rules,
+output schema. Quote one rule that is uniquely required by the
+expand direction.
+
+### Cost Projection
+- Generation calls: 300
+- Embedding calls: 3000 (10 candidates × 30 runs per probe — adjust
+  if N or stability changes)
+- Estimated batch cost: $<...>
+- Ceiling per design Decision 1: $1.00 — within budget? yes/no
+
+### Architectural Reasoning
+- Why is the code embedding space hypothesised to behave differently
+  than the description embedding space?
+- What outcome at M15 would be sufficient evidence to UNLOCK Phase 5
+  vs. DEFER to v0.3?
+- What outcome would be ambiguous, requiring an operator decision
+  rather than the gate's automatic verdict?
+
+### Anomalies
+- If any reference description had to be substituted (because v0.1
+  source was missing), document the substitution and its impact on
+  comparability.
+
+### Risks
+- (HIGH) The threshold (6/10) is a hypothesis without prior empirical
+  basis. M15's data may show the geometry is fundamentally unsuitable
+  even at cluster sizes that this mission would call "converged" —
+  M16 must check syntactic validity and semantic correctness too,
+  not just cluster size.
+- (HIGH) expand.xml is novel; if its rules are subtly wrong, M15's
+  results conflate prompt quality with geometry suitability. Note the
+  ambiguity for M16.
+- (MED) Reference implementations may have been refactored since the
+  description was generated; reconcile.
+- (LOW) Stability runs = 3 is the minimum for variance estimation;
+  bigger numbers cost proportionally.
+
+### Rollback
+`rm -rf /project/local/sprints/tooling-v0.2/probes/m14-bidirectional
+&& rm /project/pidgin/prompts/expand.xml`.
+      ]]></report>
+    </mission>
+
+    <mission n="15" tier="execute" review="false">
+      <context><![CDATA[
+M14 designed the bidirectional probes and wrote the harness. This
+mission RUNS the harness and persists the data. No judgment calls
+during execution — the harness is the spec. The output of this
+mission is data; the gate decision happens in M16.
+
+Review is false because the mission's correctness is mechanical: did
+the harness run, did the data land in results.json, are the row counts
+right? An adversarial reviewer would have nothing to critique beyond
+operational anomalies, which the report already covers.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Execute the harness from M14.
+2. Persist per-run records to
+   /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/results.json.
+3. Capture: per-run cluster_size, syntactic_valid (Python AST parse),
+   semantic_eq_to_reference (boolean — see spec for the eq test),
+   stable_across_runs (computed at M16, not here).
+4. Produce a one-page summary at .../m14-bidirectional/SUMMARY.md
+   with the raw counts. M16 reads this.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Inputs:**
+
+- /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/probes.json (M14)
+- /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/harness.py (M14)
+- /project/pidgin/prompts/expand.xml (M14)
+- OPENAI_API_KEY in env
+
+**Per-run record format:**
+
+```json
+{
+  "probe_id": "P1",
+  "function_name": "embed_for_store",
+  "budget": 50,
+  "run_idx": 0,
+  "n_candidates": 10,
+  "cluster_size": 6,
+  "converged": true,
+  "syntactic_valid": [true, true, false, true, true, true, true, false, true, true],
+  "syntactic_valid_count": 8,
+  "semantic_eq_to_reference": null,
+  "candidate_strings": ["...", "...", ...],
+  "winning_candidate": "..."
+}
+```
+
+**Syntactic validity check:**
+
+```python
+import ast
+def syntactic_valid(code: str) -> bool:
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError:
+        return False
+```
+
+The check runs over the FULL candidate string. If the model emits
+docstrings or surrounding text, the harness should attempt extraction
+heuristics (look for `def <name>(`, parse from there). If extraction
+fails, mark syntactic_valid=false.
+
+**Semantic equivalence (deferred to M16):**
+
+This mission writes `semantic_eq_to_reference: null` for every record.
+M16 evaluates by reading reference_implementation_path and the
+winning_candidate, comparing semantically. The judgment is a reason-
+tier task and lives in M16, not here.
+
+**Failure handling:**
+
+- If the API rate-limits or batch fails: HARD-fail the mission. The
+  M14 cost projection assumed success; if it fails, M14's design
+  needs revision.
+- If a single probe run errors but others succeed: log the error in
+  the per-run record (`error: "..."`), continue. The mission is
+  GREEN if ≥80% of runs produced records.
+
+**SUMMARY.md shape:**
+
+```markdown
+# M15 Bidirectional Probe Results
+
+| Probe | Budget | Run | cluster_size | syn_valid | converged |
+|-------|--------|-----|--------------|-----------|-----------|
+| P1 | 50 | 0 | 6 | 8/10 | true |
+| P1 | 50 | 1 | 7 | 9/10 | true |
+| P1 | 50 | 2 | 5 | 7/10 | false |
+| P1 | 200 | 0 | ... | ... | ... |
+| ...
+
+## Aggregates
+
+- Total runs: 30
+- Runs with converged=true: <N>/30
+- Per-probe stability (count of converged runs out of 6): P1=<N>/6, ...
+- Mean cluster_size by budget: 50=<N>, 200=<N>
+- Cost reported: $<N>
+```
+
+**No API key:**
+
+If OPENAI_API_KEY is unset, HARD-fail with a clear message naming the
+env var. This mission is non-skippable — it produces the data M16
+needs.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `test -f /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/harness.py -a -f /project/pidgin/prompts/expand.xml`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `test -n "$OPENAI_API_KEY" && echo KEY_PRESENT || echo NO_KEY`
+EXPECT CONTAINS: KEY_PRESENT
+FAIL: HARD
+
+Step 3. RUN: `mkdir -p /tmp/m15`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+**Phase 1 — Execute**
+
+Step 4. RUN: `cd /project && python /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/harness.py 2>&1 | tee /tmp/m15/run.log`
+EXPECT CONTAINS: wrote
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 5. RUN: `python -c "
+import json
+r = json.load(open('/project/local/sprints/tooling-v0.2/probes/m14-bidirectional/results.json'))
+assert isinstance(r, list)
+print(f'TOTAL_RUNS: {len(r)}')
+errored = [x for x in r if x.get('error')]
+print(f'ERRORED: {len(errored)}')
+ok = [x for x in r if not x.get('error')]
+print(f'OK: {len(ok)}')
+print(f'CONVERGED: {sum(1 for x in ok if x.get(\"converged\"))}')
+"`
+EXPECT CONTAINS: TOTAL_RUNS: 30
+FAIL: SOFT  (run count short of 30 → architect review)
+
+Step 6. RUN: `python -c "
+import json
+r = json.load(open('/project/local/sprints/tooling-v0.2/probes/m14-bidirectional/results.json'))
+ok = [x for x in r if not x.get('error')]
+ratio = len(ok) / len(r) if r else 0
+print(f'OK_RATIO: {ratio:.2f}')
+assert ratio >= 0.8, f'<80% records produced: {ratio}'
+print('OK_RATIO_PASS')
+"`
+EXPECT CONTAINS: OK_RATIO_PASS
+FAIL: HARD
+
+Step 7. Write /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/SUMMARY.md
+per the spec format. Use a small Python helper to aggregate from
+results.json.
+FAIL: HARD
+
+Step 8. RUN: `head -60 /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/SUMMARY.md`
+EXPECT CONTAINS: Aggregates
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 9. Append a "M15 Execution Log" section to README.md noting wall
+time, total cost, any rate-limit retries, any errored runs.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 15 Report
+
+**Status:** GREEN | RED
+**Files written:** results.json, SUMMARY.md
+**Files modified:** README.md (M15 execution log appended)
+
+### Step Results
+Per the template.
+
+### Aggregate Numbers
+Paste the SUMMARY.md "Aggregates" section verbatim.
+
+### Errored Runs
+List every probe_id/budget/run_idx that errored, with the error
+message.
+
+### Cost Realised
+- Total batch cost reported by OpenAI
+- Versus M14 projection: <delta>
+- Within $1.00 ceiling? yes/no
+
+### Anomalies
+- Did any probe converge MUCH better than others? Quote the candidate.
+- Did any probe consistently produce syntactically invalid output?
+- Was there variance across stability runs that suggests budget=50
+  is too tight (cluster_size collapses) or budget=200 is too loose
+  (cluster_size scatters)?
+
+### Rollback
+The data files are persisted intentionally for M16; no rollback. If
+re-run is needed, `rm /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/results.json`
+and re-execute.
+      ]]></report>
+    </mission>
+
+    <mission n="16" tier="reason" review="true">
+      <context><![CDATA[
+M14 designed the bidirectional probes; M15 ran them. This mission
+applies the gate criteria from design Decision 1 and issues the
+verdict that conditionally unlocks Phase 5.
+
+Decision 1 quoted: "if 4/5 probes produce stable, correct
+implementations, bidirectional MLD is validated and the sprint plan
+as multi-pass artifact becomes a committed feature. If fewer than
+3/5 produce stable results, the direction needs a different embedding
+model or similarity metric, and the sprint-plan feature is deferred
+to v0.3."
+
+Three outcomes:
+- ≥4/5 stable+correct: UNLOCK Phase 5. M17-M19 dispatch.
+- 3/5 stable+correct: AMBIGUOUS — surface to operator. M17-M19 do
+  not dispatch automatically.
+- <3/5 stable+correct: DEFER to v0.3. Close sprint at M16.
+
+This mission is REASON tier because:
+1. "Stable across runs" requires looking at the 3 stability runs per
+   (probe, budget) and judging consistency.
+2. "Semantically correct vs original" requires reading the winning
+   candidate and the reference implementation and judging equivalence
+   (no automated test; the reference may not have a test suite).
+3. The verdict directly determines whether 3 more missions execute,
+   committing API spend and architect time.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Read /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/results.json.
+2. For each probe: across the 6 runs (2 budgets × 3 stability), judge
+   STABLE (≥4/6 runs converged + cluster sizes within ±2 of each
+   other in stable runs).
+3. For each STABLE probe: judge SEMANTIC_CORRECT (winning candidate
+   does the same thing as reference implementation). Operator-style
+   review of code; document the judgment per probe.
+4. Apply the gate: count STABLE+CORRECT probes. ≥4 = UNLOCK; 3 =
+   AMBIGUOUS (defer to operator); <3 = DEFER.
+5. Write /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/GATE.md
+   with the verdict, the per-probe judgment, the rationale, and the
+   recommended next action.
+6. If UNLOCK: M17-M19 are clear to run.
+   If AMBIGUOUS: surface to operator with a clear question.
+   If DEFER: close the sprint at M16 with the gate decision as the
+   final artifact.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Inputs:**
+
+- results.json (M15)
+- SUMMARY.md (M15)
+- probes.json (M14)
+- The 5 reference implementations (paths in probes.json).
+
+**STABLE rule (mechanical, then judgment):**
+
+```
+mechanical_stable(probe) :=
+  let runs = [r for r in results if r.probe_id == probe.id and not r.error]
+  let converged_count = sum(1 for r in runs if r.converged)
+  let cluster_sizes_in_converged = [r.cluster_size for r in runs if r.converged]
+  return converged_count >= 4
+     and (max(cluster_sizes_in_converged) - min(cluster_sizes_in_converged) <= 2)
+```
+
+If mechanically stable AND the winning candidates across the converged
+runs are textually similar (string-similarity proxy: shared lines ≥
+50%), call the probe STABLE. If mechanically stable but winning
+candidates diverge wildly, call it UNSTABLE — convergence cluster size
+alone is not stability.
+
+**SEMANTIC_CORRECT rule (judgment):**
+
+For each STABLE probe:
+1. Pick the most-frequent winning candidate across converged runs.
+2. Read the reference implementation at probe.reference_implementation_path.
+3. Judge: does the winning candidate produce the same observable
+   behaviour for the function's documented inputs/outputs?
+   - Same signature: SHOULD match (modulo type hints).
+   - Same return type: MUST match.
+   - Same side effects: MUST match (e.g. both write to a file, both
+     mutate state, both raise on division by zero).
+   - Same error semantics: MUST match where the description specified.
+
+If the judgment is YES → CORRECT. If NO → INCORRECT. If AMBIGUOUS →
+INCORRECT (we err strict; the gate is meant to be hard to clear).
+
+Document the judgment for each probe in GATE.md with quotes from the
+candidate AND the reference.
+
+**Verdict:**
+
+```
+correct_count = sum(1 for p in probes if STABLE(p) and CORRECT(p))
+
+if correct_count >= 4: VERDICT = "UNLOCK"
+elif correct_count == 3: VERDICT = "AMBIGUOUS_OPERATOR_DECIDES"
+else: VERDICT = "DEFER_V03"
+```
+
+**GATE.md shape:**
+
+```markdown
+# M16 Bidirectional MLD Gate Decision
+
+**Verdict:** UNLOCK | AMBIGUOUS | DEFER
+**Stable+Correct probes:** <N>/5
+**Date:** <ISO date>
+**Decision authority:** sprint architect (per design Decision 1)
+
+## Per-Probe Judgment
+
+### P1 — embed_for_store
+- Mechanical stability: <converged_count>/6 runs, cluster size range [<lo>, <hi>]
+- Stable: yes/no (with rationale)
+- Semantic correctness: yes/no (with quoted comparison)
+
+### P2 — main
+...
+
+## Rationale
+
+<2-4 paragraphs explaining the verdict, what surprised us, what the
+data implied about the code embedding space.>
+
+## Next Action
+
+If UNLOCK:
+> M17-M19 may dispatch. Phase 5 is a committed feature for v0.2.
+
+If AMBIGUOUS:
+> Operator decision required. Recommended question:
+> "Probe X showed Y; do we accept it as CORRECT or treat its
+> ambiguity as INCORRECT? Same question for any other ambiguous probe."
+
+If DEFER:
+> Phase 5 (M17-M19) is removed from this sprint. The bidirectional MLD
+> direction is deferred to v0.3. Recommended next-sprint experiment:
+> <one-paragraph hypothesis on what would unblock the geometry —
+> different embedding model? Different similarity metric? AST-aware
+> distance instead of cosine?>
+```
+
+**No code is committed in this mission.** GATE.md is the only artifact.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `test -f /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/results.json -a -f /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/SUMMARY.md`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. Read results.json and probes.json into context.
+FAIL: HARD
+
+Step 3. For each probe, read its reference_implementation_path.
+FAIL: HARD
+
+**Phase 1 — Judgment**
+
+Step 4. For each of the 5 probes, compute mechanical stability and
+record (converged_count, cluster_size_range, stable_yes_no, rationale).
+FAIL: HARD
+
+Step 5. For each STABLE probe, judge semantic correctness against the
+reference. Quote the winning candidate AND the reference for each
+judgment.
+FAIL: HARD
+
+Step 6. Compute correct_count and resolve VERDICT.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 7. Write /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/GATE.md
+per the spec shape.
+FAIL: HARD
+
+Step 8. RUN: `grep -E '^\*\*Verdict:\*\* (UNLOCK|AMBIGUOUS|DEFER)' /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/GATE.md`
+EXPECT MATCHES: Verdict:
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 9. If verdict is UNLOCK or AMBIGUOUS: leave M17-M19 in the sprint
+plan as-is. If DEFER: write a brief note at the top of the sprint
+log.md (if it exists) or in GATE.md saying M17-M19 will not dispatch.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 16 Report
+
+**Status:** GREEN | RED
+**Files written:** GATE.md
+**Files modified:** none
+
+### Step Results
+Per the template.
+
+### Verdict
+Quote the verdict line from GATE.md.
+
+### Per-Probe Judgment Summary
+Table: probe_id, mechanical_stable, semantic_correct, contributes_to_count.
+
+### Architectural Reasoning
+- What did the data say about the code embedding space?
+- Was budget=50 vs 200 the binding constraint, or did both behave
+  similarly?
+- If DEFER, what experiment in v0.3 has the highest expected value
+  to unblock the direction?
+
+### Anomalies
+- Probes whose mechanical stability disagreed with semantic
+  correctness — quote and explain.
+- Reference implementations that were materially different from the
+  description (suggests M14's description selection had drift).
+
+### Risks
+- (HIGH) Strict gate (4/5) is by design; if verdict is AMBIGUOUS at
+  3/5, the operator decision becomes load-bearing. Surface it
+  clearly.
+- (MED) Semantic-correctness judgment is human; this report is the
+  audit trail. Quote evidence so future-self can re-judge.
+- (MED) UNLOCK verdict commits ~3 more missions of work; ensure the
+  gate is right before signalling it.
+
+### Rollback
+GATE.md is the artifact; rollback is `rm GATE.md` and re-run M16
+with adjusted criteria. The judgment is reproducible from the data.
+      ]]></report>
+    </mission>
+
+    <mission n="17" tier="execute" review="true">
+      <context><![CDATA[
+**Conditional on M16 verdict = UNLOCK** (or AMBIGUOUS resolved by
+operator in favour of proceeding). DO NOT DISPATCH if M16 = DEFER.
+
+Phase 5 implements sprint-plan-as-multi-pass-artifact per
+bidirectional-mld.md. A sprint plan is written in natural language
+(pass 1), MLD-compressed by Pidgin (pass 2), implemented by
+description→code convergence (pass 3), validated by the sprint writer
+(pass 4). Each pass reads and writes specific XML-tagged regions; the
+document accumulates state.
+
+This mission defines the four-pass XML template — the artifact format
+M18 (the processor) will operate on and M19 (integration validation)
+will exercise end-to-end on this sprint's own plan.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Define /project/templates/sprint-package/sprint-multipass.xml
+   with the four-pass mission element shape per bidirectional-mld.md.
+2. Each `<mission>` element contains four child tags in fixed order:
+   `<description>` (pass 1, human), `<compressed>` (pass 2, Pidgin),
+   `<implementation>` (pass 3, Pidgin), `<validation>` (pass 4, human).
+3. Pass markers (`<pass n="1"/>`, `<pass n="2"/>`, ...) record which
+   passes have completed.
+4. Self-test: `xml.etree.ElementTree` parses the template; the
+   structure matches the spec.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to create:**
+
+- /project/templates/sprint-package/sprint-multipass.xml
+
+**Document structure:**
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Multi-pass sprint plan template (Phase 5 / M17 — bidirectional MLD).
+  Each mission accumulates state across four passes.
+-->
+<sprint name="" version="" multipass="true">
+  <summary>
+    <!-- Pass 1: human-authored, never overwritten. -->
+  </summary>
+
+  <passes_completed>
+    <!-- Pass 2/3 processors append <pass n="N" timestamp="..." /> here. -->
+  </passes_completed>
+
+  <missions>
+    <mission n="1" tier="execute" review="true">
+      <description>
+        <!-- Pass 1 (human): natural-language mission description.
+             Read by pass 2; never rewritten by any pass. -->
+      </description>
+
+      <compressed>
+        <!-- Pass 2 (Pidgin compress): MLD-compressed description.
+             The specification. Generated by pidgin compress reading
+             <description>. Read by pass 3; written ONCE. -->
+      </compressed>
+
+      <implementation>
+        <!-- Pass 3 (Pidgin expand): generated code for the mission.
+             Generated by description→code convergence reading
+             <compressed>. Read by pass 4; written ONCE. -->
+      </implementation>
+
+      <validation>
+        <!-- Pass 4 (human): validation notes. Sprint writer reviews
+             <implementation> against <compressed> and records:
+             ACCEPTED / NEEDS_REFINEMENT / REJECTED, with rationale. -->
+      </validation>
+    </mission>
+  </missions>
+</sprint>
+```
+
+**Pass invariants:**
+
+- Pass 1 NEVER overwritten.
+- Pass 2 written exactly once. If <compressed> already populated, M18
+  (the processor) skips it for that mission.
+- Pass 3 written exactly once. Same skip rule.
+- Pass 4 may be re-edited by humans freely.
+
+**Pass marker format:**
+
+```xml
+<passes_completed>
+  <pass n="2" timestamp="2026-04-26T14:00:00Z" tool="pidgin compress"/>
+  <pass n="3" timestamp="2026-04-26T14:30:00Z" tool="pidgin expand"/>
+</passes_completed>
+```
+
+**Acceptance:**
+
+- Template parses as well-formed XML.
+- All four child tags present per mission element.
+- Comment markers naming pass purpose are inline.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `test -f /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/GATE.md && grep -E '^\*\*Verdict:\*\* (UNLOCK|AMBIGUOUS)' /project/local/sprints/tooling-v0.2/probes/m14-bidirectional/GATE.md`
+EXPECT MATCHES: Verdict:
+FAIL: HARD  (M16 must have unlocked Phase 5; if DEFER, this mission
+             must not dispatch)
+
+**Phase 1 — Write**
+
+Step 2. Write /project/templates/sprint-package/sprint-multipass.xml
+per spec.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 3. RUN: `python -c "import xml.etree.ElementTree as ET; t = ET.parse('/project/templates/sprint-package/sprint-multipass.xml').getroot(); print('valid'); print('multipass:', t.get('multipass')); print('mission_children:', [c.tag for c in t.findall('missions/mission/*')])"`
+EXPECT CONTAINS: valid
+FAIL: HARD
+
+Step 4. RUN: `python -c "
+import xml.etree.ElementTree as ET
+t = ET.parse('/project/templates/sprint-package/sprint-multipass.xml').getroot()
+m = t.find('missions/mission')
+required = ['description', 'compressed', 'implementation', 'validation']
+present = [c.tag for c in m]
+assert present == required, f'order/contents mismatch: {present}'
+print('mission_shape_ok')
+"`
+EXPECT CONTAINS: mission_shape_ok
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 5. Edit /project/templates/sprint-package/CLAUDE.md to add
+sprint-multipass.xml entry.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 6. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 17 Report
+
+**Status:** GREEN | RED
+**Files written:** sprint-multipass.xml
+**Files modified:** templates/sprint-package/CLAUDE.md
+
+### Step Results
+Per the template.
+
+### Template Decisions
+- Did pass markers go inside `<passes_completed>` (per spec) or
+  per-mission attributes? Defend.
+- How does the template handle missions where pass 4 declares
+  REJECTED — does the document mark the mission inactive?
+
+### Anomalies
+- Comment placement vs schema strictness — any cases where comments
+  inside pass-content tags would confuse the processor?
+
+### Risks
+- (HIGH) Pass 3 generates CODE inside an XML tag; CDATA wrapping must
+  be handled by M18's processor or generated code with `<` characters
+  will corrupt the document.
+- (MED) Pass 2 writing is "once" — if compress is re-run accidentally,
+  the new MLD overwrites the old without trace. Add a check in M18.
+- (LOW) sprint-multipass.xml lives alongside sprint.xml — operators
+  may confuse them. Document.
+
+### Rollback
+`rm /project/templates/sprint-package/sprint-multipass.xml`.
+      ]]></report>
+    </mission>
+
+    <mission n="18" tier="execute" review="true">
+      <context><![CDATA[
+M17 defined the four-pass template. This mission ships the processor
+that walks a sprint-multipass.xml document and runs passes 2 and 3
+(passes 1 and 4 are human). Pass 2: read each `<description>`, run
+`pidgin compress` over it, write `<compressed>`. Pass 3: read each
+`<compressed>`, run description→code convergence, write
+`<implementation>`. Each pass is idempotent at the mission level —
+re-running pass 2 on a mission with `<compressed>` already populated
+SKIPS that mission unless --force.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Implement /project/pidgin/multipass/processor.py with
+   `run_pass(doc_path, n, force=False)`.
+2. Pass 2 routes to pidgin.write.compress mechanics adapted for
+   in-XML-tag output (the result is XML-escaped text, not a file).
+3. Pass 3 routes to expand.xml + description→code convergence
+   (validated in M14/M15/M16). Selects the WINNING candidate
+   (highest cluster centroid similarity).
+4. Self-test: process a 3-mission synthetic sprint plan through pass 2
+   and pass 3; verify <compressed> and <implementation> populate
+   exactly once and `<passes_completed>` records both passes.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to create:**
+
+- /project/pidgin/multipass/__init__.py
+- /project/pidgin/multipass/processor.py
+
+**Public API:**
+
+```python
+def run_pass(
+    doc_path: str,
+    n: int,                # 2 or 3
+    *,
+    force: bool = False,
+    dispatch: Literal["auto","sync","batch"] = "auto",
+) -> dict:
+    """Process pass `n` over the multipass document at `doc_path`.
+    Return a summary dict: {missions_processed, missions_skipped,
+    missions_errored, written_passes_completed}."""
+```
+
+**Pass 2 (compress):**
+
+For each `<mission>`:
+1. If `<compressed>` non-empty and not `force`: skip.
+2. Read `<description>` text content (strip surrounding whitespace).
+3. Call `pidgin compress` mechanics: take the text as input, produce
+   a single MLD-compressed string. (This is the SAME compression
+   used by `pidgin compress` verb, but the output goes into the XML
+   tag, not a file.)
+4. Replace `<compressed></compressed>` content with the result,
+   wrapping in CDATA if the result contains `<`, `>`, or `&`.
+5. Append `<pass n="2" timestamp="..." tool="pidgin compress"/>` to
+   `<passes_completed>`.
+6. Write the document atomically (write to .tmp then os.replace).
+
+**Pass 3 (expand):**
+
+For each `<mission>`:
+1. If `<implementation>` non-empty and not `force`: skip.
+2. If `<compressed>` empty: error (pass 2 must run first); record
+   in summary dict.
+3. Read `<compressed>` text. Use as input to description→code
+   convergence with N=10 candidates, budget per probe (use
+   M14-validated default), expand.xml as the prompt.
+4. Pick the WINNING candidate: the candidate whose embedding is
+   closest to the cluster centroid (per geometry.py).
+5. Replace `<implementation></implementation>` with the winning
+   candidate, wrapped in CDATA.
+6. Append `<pass n="3" .../>` to `<passes_completed>`.
+7. Write atomically.
+
+**Atomic XML edit:**
+
+Use `xml.etree.ElementTree` to parse, mutate, and write. To preserve
+formatting and CDATA, use lxml if available (cleaner CDATA support);
+fall back to ElementTree with manual CDATA wrapping. Document the
+approach.
+
+**Force semantics:**
+
+- `--force` re-runs the pass even if the target tag is populated.
+- Re-running overwrites silently. Operators should commit before
+  --force to preserve the prior state in git.
+- The audit trail in `<passes_completed>` records the second pass as
+  a new entry — both pass-2 entries remain; the latest wins by
+  document order.
+
+**Provenance comment:**
+
+```python
+# pidgin v0.2 — NEW.
+# Multi-pass sprint plan processor (bidirectional MLD / Phase 5).
+# Pass 2 routes to compress mechanics; pass 3 to expand.xml + winning
+# candidate selection. Idempotent per mission unless force=True.
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `test -f /project/templates/sprint-package/sprint-multipass.xml`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `mkdir -p /tmp/m18`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+**Phase 1 — Write**
+
+Step 3. Write /project/pidgin/multipass/__init__.py exporting `run_pass`.
+FAIL: HARD
+
+Step 4. Write /project/pidgin/multipass/processor.py per spec.
+FAIL: HARD
+
+**Phase 2 — Verify**
+
+Step 5. Write /tmp/m18/synthetic.xml — a 3-mission multipass document
+with `<description>` populated, other tags empty. Use real but
+trivial descriptions (e.g. "Add two integers", "Return the larger of
+two values", "Reverse a string").
+FAIL: HARD
+
+Step 6. RUN: `python -c "
+import sys; sys.path.insert(0, '/project')
+from pidgin.multipass import run_pass
+summary = run_pass('/tmp/m18/synthetic.xml', n=2)
+print('PASS2:', summary)
+"`
+EXPECT CONTAINS: missions_processed
+FAIL: HARD
+
+Step 7. RUN: `python -c "
+import xml.etree.ElementTree as ET
+t = ET.parse('/tmp/m18/synthetic.xml').getroot()
+filled = [m for m in t.findall('missions/mission') if (m.findtext('compressed') or '').strip()]
+print(f'FILLED_COMPRESSED: {len(filled)}/3')
+assert len(filled) == 3
+print('PASS2_FILLED_OK')
+"`
+EXPECT CONTAINS: PASS2_FILLED_OK
+FAIL: SOFT  (live API may be unavailable; if so, document)
+
+Step 8. RUN: `python -c "
+import sys; sys.path.insert(0, '/project')
+from pidgin.multipass import run_pass
+summary = run_pass('/tmp/m18/synthetic.xml', n=3)
+print('PASS3:', summary)
+"`
+EXPECT CONTAINS: missions_processed
+FAIL: SOFT
+
+Step 9. RUN: `python -c "
+import xml.etree.ElementTree as ET
+t = ET.parse('/tmp/m18/synthetic.xml').getroot()
+filled = [m for m in t.findall('missions/mission') if (m.findtext('implementation') or '').strip()]
+print(f'FILLED_IMPL: {len(filled)}/3')
+passes = t.findall('passes_completed/pass')
+print(f'PASSES_RECORDED: {[p.get(\"n\") for p in passes]}')
+"`
+EXPECT CONTAINS: FILLED_IMPL:
+FAIL: SOFT
+
+Step 10. RUN (idempotency test): `python -c "
+import sys; sys.path.insert(0, '/project')
+from pidgin.multipass import run_pass
+summary = run_pass('/tmp/m18/synthetic.xml', n=2)  # re-run without force
+assert summary['missions_skipped'] == 3, summary
+print('IDEMPOTENT_OK')
+"`
+EXPECT CONTAINS: IDEMPOTENT_OK
+FAIL: HARD
+
+**Phase 3 — Documentation**
+
+Step 11. Write /project/pidgin/multipass/CLAUDE.md — discovery index
+for the processor.
+FAIL: SOFT
+
+**Phase 4 — Report**
+
+Step 12. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 18 Report
+
+**Status:** GREEN | RED
+**Files written:** /project/pidgin/multipass/{__init__.py, processor.py, CLAUDE.md}
+**Files modified:** none
+
+### Step Results
+Per the template.
+
+### Live Pass Output
+- Pass 2 result on synthetic doc (paste compressed text for one mission)
+- Pass 3 result on synthetic doc (paste implementation for one mission)
+- Were either pass live, or did API unavailability cause SOFT skips?
+
+### Idempotency Confirmed
+Quote the summary dict from the re-run.
+
+### Anomalies
+- CDATA wrapping mechanics chosen (lxml vs ElementTree workaround)
+- Any encoding issues (non-ASCII descriptions)
+
+### Risks
+- (HIGH) Pass 3 commits the WINNING candidate without human review;
+  if expand.xml is wrong (M14 gate caveat), bad code lands silently.
+  Mitigation: pass 4 (validation) is human; commits to <implementation>
+  should land in a separate commit so reverts are easy.
+- (HIGH) Atomic XML edit must preserve comments and pass-marker order;
+  if rewriting reorders them, the audit trail becomes harder to read.
+- (MED) Force semantics keep both pass entries in <passes_completed> —
+  operators may interpret as bug. Document.
+- (LOW) Description text whitespace stripping may lose intentional
+  formatting; verify on real sprint plans in M19.
+
+### Rollback
+`rm -rf /project/pidgin/multipass /tmp/m18`.
+      ]]></report>
+    </mission>
+
+    <mission n="19" tier="reason" review="true">
+      <context><![CDATA[
+**Conditional on M16 = UNLOCK.** The capstone of v0.2: run the
+four-pass cycle on a real sprint plan — specifically, this sprint's
+own plan (sprint.xml). The sprint validates itself.
+
+This is REASON tier because:
+1. Translating sprint.xml (single-pass) into a sprint-multipass.xml
+   target requires judgment about how to map mission specs into
+   `<description>` content (whole-spec vs objective-only vs
+   summary-only).
+2. Reviewing the generated `<implementation>` blocks against the
+   `<compressed>` blocks is the same pass-4 human-review judgment
+   M18 left to a future caller — but here we exercise it
+   end-to-end as architects.
+3. The success criterion is non-mechanical: "the converged
+   implementations are recognisable, useful starting points for the
+   actual mission code, even if not directly committable." That
+   bar is set in this report.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Translate /project/local/sprints/tooling-v0.2/sprint.xml into a
+   matching /project/local/sprints/tooling-v0.2/sprint-multipass.xml
+   with `<description>` populated for each mission and other tags
+   empty.
+2. Run `pidgin.multipass.run_pass` for n=2 and n=3 over the new
+   document.
+3. Pass-4 review: read each generated `<implementation>` against
+   the matched `<compressed>` AND against the original mission's
+   `<specification>`. Mark each `<validation>` as ACCEPTED /
+   NEEDS_REFINEMENT / REJECTED with one-paragraph rationale.
+4. Compute aggregate metrics: <ACCEPTED count>/<total>, total cost,
+   wall time.
+5. Write /project/local/sprints/tooling-v0.2/probes/m19-self-validation/REPORT.md
+   with the full assessment.
+6. Final disposition: was bidirectional MLD a v0.2-ship-quality
+   feature, or does it need v0.3 refinement before being relied on
+   for sprint plan generation?
+      ]]></objective>
+
+      <specification><![CDATA[
+**Translation rules (sprint.xml → sprint-multipass.xml):**
+
+For each `<mission>` in sprint.xml:
+1. Take the mission's `<objective>` text content as the
+   `<description>`. Rationale: the objective is the most
+   description-shaped tag — natural-language goals, not API contracts.
+2. Drop `<context>`, `<specification>`, `<steps>`, `<report>` —
+   these are sprint-runner concerns, not mission-content concerns.
+3. Preserve `n`, `tier`, `review` attributes.
+4. Initialise `<compressed>`, `<implementation>`, `<validation>` as
+   empty.
+
+**Pass 2 + Pass 3:**
+
+Run via `pidgin.multipass.run_pass`. Total budget projection:
+- 19 missions × pass 2: 19 compress calls. At 10 candidates each
+  for the convergence test, ~$0.20 batched.
+- 19 missions × pass 3: 19 expand calls × 10 candidates. At ~$0.40
+  batched.
+- Total: ~$0.60. Within the $2.00 sprint cap.
+
+**Pass 4 review (judgment):**
+
+For each mission:
+- Read `<compressed>` (Pidgin's MLD of objective).
+- Read `<implementation>` (Pidgin's code attempt).
+- Read the ORIGINAL mission's `<specification>` (not seen by Pidgin).
+- Judge:
+  - ACCEPTED: implementation is a recognisable starting point for
+    the spec; would shorten the executor's work.
+  - NEEDS_REFINEMENT: implementation captures the shape but misses
+    key details from <specification>.
+  - REJECTED: implementation is structurally wrong or unrelated.
+
+Document with one-paragraph rationale per mission.
+
+**Disposition:**
+
+- ≥15/19 ACCEPTED: bidirectional MLD ships as a v0.2 feature.
+  `pidgin compose` is added to the verb registry as a near-term
+  follow-up.
+- 10-14/19 ACCEPTED: useful but not ship-quality. Document the
+  failure modes; v0.3 takes the lessons.
+- <10/19 ACCEPTED: M16's gate was over-optimistic. Roll back the
+  Phase 5 commitment in v0.2's success criteria; document why
+  the gate-validated geometry didn't transfer to real sprint plan
+  content.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+Step 1. RUN: `test -f /project/local/sprints/tooling-v0.2/sprint.xml -a -f /project/templates/sprint-package/sprint-multipass.xml`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 2. RUN: `mkdir -p /project/local/sprints/tooling-v0.2/probes/m19-self-validation`
+EXPECT EXIT CODE: 0
+FAIL: HARD
+
+Step 3. RUN: `test -f /project/pidgin/multipass/processor.py`
+EXPECT EXIT CODE: 0
+FAIL: HARD  (M18 must have run)
+
+**Phase 1 — Translate**
+
+Step 4. Write /project/local/sprints/tooling-v0.2/sprint-multipass.xml
+by translating sprint.xml per the spec rules. Preserve all 19 missions.
+FAIL: HARD
+
+Step 5. RUN: `python -c "
+import xml.etree.ElementTree as ET
+t = ET.parse('/project/local/sprints/tooling-v0.2/sprint-multipass.xml').getroot()
+ms = t.findall('missions/mission')
+desc_filled = [m for m in ms if (m.findtext('description') or '').strip()]
+empty_others = all(not (m.findtext('compressed') or '').strip() and
+                   not (m.findtext('implementation') or '').strip() and
+                   not (m.findtext('validation') or '').strip()
+                   for m in ms)
+print(f'MISSIONS: {len(ms)}, DESC_FILLED: {len(desc_filled)}, OTHERS_EMPTY: {empty_others}')
+assert len(ms) == 19, len(ms)
+assert len(desc_filled) == 19
+assert empty_others
+print('TRANSLATION_OK')
+"`
+EXPECT CONTAINS: TRANSLATION_OK
+FAIL: HARD
+
+**Phase 2 — Process**
+
+Step 6. RUN: `cd /project && python -c "
+import sys; sys.path.insert(0, '/project')
+from pidgin.multipass import run_pass
+import time, json
+t0 = time.time()
+s2 = run_pass('/project/local/sprints/tooling-v0.2/sprint-multipass.xml', n=2, dispatch='batch')
+print('PASS2:', json.dumps(s2))
+s3 = run_pass('/project/local/sprints/tooling-v0.2/sprint-multipass.xml', n=3, dispatch='batch')
+print('PASS3:', json.dumps(s3))
+print(f'WALL_TIME: {time.time() - t0:.1f}s')
+" 2>&1 | tee /project/local/sprints/tooling-v0.2/probes/m19-self-validation/processing.log`
+EXPECT CONTAINS: PASS3
+FAIL: SOFT  (live API needed; if unavailable, document and run M19
+             after the architect provides keys)
+
+**Phase 3 — Review**
+
+Step 7. For each of the 19 missions, perform pass-4 review per spec:
+read <compressed>, <implementation>, ORIGINAL <specification>,
+write <validation> verdict + rationale into the multipass document.
+FAIL: HARD
+
+Step 8. Compute aggregates and write
+/project/local/sprints/tooling-v0.2/probes/m19-self-validation/REPORT.md.
+FAIL: HARD
+
+Step 9. RUN: `grep -E '^\*\*Disposition:\*\*' /project/local/sprints/tooling-v0.2/probes/m19-self-validation/REPORT.md`
+EXPECT CONTAINS: Disposition
+FAIL: HARD
+
+**Phase 4 — Report**
+
+Step 10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+## Mission 19 Report
+
+**Status:** GREEN | RED
+**Files written:** sprint-multipass.xml, REPORT.md
+**Files modified:** sprint-multipass.xml (passes 2/3/4 populated
+                    in-place)
+
+### Step Results
+Per the template.
+
+### Aggregate Metrics
+- ACCEPTED: <N>/19
+- NEEDS_REFINEMENT: <N>/19
+- REJECTED: <N>/19
+- Total cost: $<...>
+- Total wall time: <...>s
+
+### Per-Mission Verdict Table
+Compact table: mission_n, verdict, one-line rationale.
+
+### Disposition
+Quote the disposition line from REPORT.md.
+
+### Architectural Reasoning
+- Did Pidgin's MLD-compress over mission objectives produce specs
+  that were USEFUL or HOLLOW? Quote one of each.
+- Did pass-3 implementations map well to mission types (write code
+  vs run probes vs document)?
+- What does this say about whether sprint authoring should adopt the
+  multi-pass pattern in v0.3?
+
+### Anomalies
+- Missions where the implementation was so wrong that it suggests a
+  bug in expand.xml or the winner-selection rule (not the geometry).
+- Missions where the compressed description revealed a flaw in the
+  ORIGINAL spec (an unexpected positive outcome of the exercise).
+
+### Risks
+- (HIGH) The v0.2 disposition rests on 19 data points generated by
+  the same model on the same day — model drift could change the
+  result; commit the artifacts so v0.3 can re-run and compare.
+- (MED) The judgment is the architect's; document evidence for each
+  ACCEPTED so future re-runs can be sanity-checked.
+- (LOW) Self-validation has a flattering bias — the gate criteria
+  were tuned to this exact sprint's content. Transferability to
+  other repos is open.
+
+### Rollback
+`rm -rf /project/local/sprints/tooling-v0.2/probes/m19-self-validation
+&& rm /project/local/sprints/tooling-v0.2/sprint-multipass.xml`.
+The original sprint.xml is untouched.
+      ]]></report>
+    </mission>
+
+  </missions>
+</sprint>

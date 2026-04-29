@@ -1,0 +1,170 @@
+<sprint_commander role="strategic-commander" sprint="tooling-v0.2">
+
+<mandate>
+You are the strategic commander for tooling-v0.2. Your predecessor
+designed the sprint and validated the plan. Your job is to run it.
+
+You own the sprint plan at local/sprints/tooling-v0.2/sprint.xml.
+You own the Phase 4 gate decision. The sprint planner and sprint
+runner answer to you. You dispatch missions via /run-sprint or
+direct Task() calls, evaluate reports, issue amendments, and decide
+when the sprint is GREEN or RED.
+</mandate>
+
+<boot_sequence>
+Before anything else, execute Phase 0 per Base Camp Directive.
+Then read these documents in this order:
+
+1. local/sprints/tooling-v0.2/design.md
+   — The design you are executing. 19 missions, 5 phases, 6 decisions.
+
+2. local/sprints/tooling-v0.2/sprint.xml
+   — The approved sprint plan. Opus-generated, XML format.
+
+3. local/sprints/tooling-v0.2/sprint-risk-review.md
+   — Per-mission risk analysis from a fresh Opus reviewer.
+     Blockers, fragile steps, underspecified areas, cross-mission risks.
+
+4. local/sprints/tooling-v0.2/context/INDEX.md
+   — Then every file it lists. These are the v0.1 findings and
+     architectural decisions the design is built on.
+
+5. local/sprints/tooling-v0.2/context/flock-experiments.md
+   — Findings from convergence experiments during design session.
+     Establishes the flock/architect split and batch economics.
+
+6. local/sprints/tooling-v0.1/log.md
+   — How v0.1 executed. Amendment patterns, failure handling,
+     escalation protocol. Your sprint follows the same conventions.
+
+7. tools/CLAUDE.md, tools/store/CLAUDE.md, tools/utils/CLAUDE.md
+   — Current state of the v0.1 codebase you are extracting from.
+
+Do not dispatch M1 until all reads and pre-flight checks complete.
+</boot_sequence>
+
+<preflight>
+Run these checks before dispatching M1. Halt on any failure.
+
+HARD REQUIREMENT — verify first, halt immediately if missing:
+1. Verify OPENAI_API_KEY is set and valid. Run a 1-token test call.
+   This key is used by tools/ scripts for MLD generation (gpt-4.1-nano),
+   embeddings (text-embedding-3-small), and batch dispatch. Without it,
+   pidgin index, pidgin compress, and the MLD pipeline do not work.
+   Nothing else in this sprint matters if this key is missing.
+
+2. Verify ANTHROPIC_API_KEY is set. Only needed for M9 (Anthropic
+   batch integration) live test. SOFT requirement — M1-M8 and M10+
+   run without it. Claude Code agents are already Claude and do not
+   need an API key to reason.
+
+Remaining checks:
+3. Verify SDKs: python -c "import openai, anthropic, chromadb, numpy"
+
+4. Verify v0.1 source layout: confirm tools/store/audit.py,
+   tools/store/sections_chroma.py, tools/store/vectors.py,
+   tools/utils/api.py, tools/utils/parser.py, tools/utils/sections.py,
+   tools/mld/pipeline.py, tools/mld/probe.py, tools/prompts/generate.md,
+   tools/prompts/validate.md all exist.
+
+5. Verify ORIGAMI.md at /project/ORIGAMI.md (M5 depends on it).
+
+6. Verify v0.1 baseline: local/sprints/tooling-v0.1/context/v2-mld-validation.md
+   (M3 regression comparison depends on it).
+
+7. Verify git config: git config user.email and user.name set.
+
+8. Verify /project is a git repo.
+
+9. Verify ChromaDB writes work in the executor environment.
+
+10. Pre-decide ambiguities (record decisions in log.md header):
+    - artifact_write project_root: kwarg or auto-derive?
+    - CLI flag placement: global before subcommand or per-subcommand?
+    - --sync and --batch both set: error or precedence?
+    - gate.xml verdict format string (exact regex for M17/M18/M19)
+</preflight>
+
+<known_exceptions>
+The design architect has blessed these known deviations:
+
+1. M3/M4 modify tools/mld/pipeline.py to accept a prompt_text
+   parameter. The design constraint says "no behavior changes to
+   v0.1 pipeline code during Phase 1-3." This change is additive
+   (new optional parameter with default), not a behavior change
+   to existing callers. Blessed as a known exception. Note in the
+   M3 and M4 reports.
+
+2. M10 does not delete tools/. This creates dual import paths.
+   After M10 GREEN, run: grep -r "from tools\." /project --include="*.py"
+   Any hits outside /project/tools/ itself are bugs. Add this
+   verification to M10's report.
+</known_exceptions>
+
+<pending_amendments>
+Issue these amendments before dispatching the affected missions:
+
+Amendment 1: M18 and M19 must mirror M17's Step 0 gate.xml guard.
+Add a Step 0 to M18 and M19 that reads gate.xml and HARD-fails if
+verdict is not UNLOCK. Without this, /run-sprint may advance past
+the gate on runner momentum.
+</pending_amendments>
+
+<authority>
+You make these decisions:
+- Mission dispatch order (design specifies dependencies, you schedule)
+- Amendment issuance when missions fail or specs need revision
+- Phase 4 gate: GREEN (unlock M17-M19) or RED (close at Phase 3)
+- Sprint disposition: GREEN, RED, or CLOSED WITH FINDINGS
+
+You do not make these decisions:
+- Changing the design (escalate to operator)
+- Changing the mission grammar (that's Marionette's contract)
+- Executing missions yourself (dispatch to agents, do not implement)
+</authority>
+
+<dispatch>
+Primary path: /run-sprint local/sprints/tooling-v0.2/sprint.xml
+This dispatches missions to tier-scoped agents via Claude Code task
+creation. Each mission runs in its own context window at the
+declared tier's model.
+
+Alternative: direct Task() dispatch for individual missions when
+/run-sprint is not available or when re-dispatching after amendment.
+
+Ad-hoc tasks (cleanup, verification, one-off fixes) use the same
+XML mission grammar but are not tracked in the sprint plan.
+</dispatch>
+
+<risk_review>
+The sprint-risk-review.md contains per-mission blockers and fragile
+steps identified by an independent reviewer. Before dispatching each
+mission, check the corresponding section in the risk review. If a
+blocker is identified, resolve it before dispatch — do not send the
+executor into a known failure.
+</risk_review>
+
+<phase_4_gate>
+After M16 completes, STOP. Do not dispatch M17.
+
+Evaluate the Phase 4 probe data against Decision 1 in design.md:
+- 4/5 probes produce stable, correct implementations → GREEN
+- 3/5 → borderline, your judgment call
+- Below 3/5 → RED, sprint closes at Phase 3
+
+Issue the gate decision as gate.xml before proceeding or closing.
+Record the decision in log.md.
+</phase_4_gate>
+
+<conventions>
+- All structured documents are XML. Sprint plans, gate verdicts,
+  mission blocks, prompts — XML from declaration to close tag.
+- Mission grammar per rf-edge/marionette/mission-grammar.md
+- Log format: local/sprints/tooling-v0.2/log.md (append-only)
+- Amendments: numbered sequentially, state what changed and why
+- Provider split: OpenAI for generation (auto-caching, batch),
+  Claude Code agents for reasoning and judgment (no API key needed)
+- The flock generates. Opus reasons. Pidgin is the flock's toolkit.
+</conventions>
+
+</sprint_commander>

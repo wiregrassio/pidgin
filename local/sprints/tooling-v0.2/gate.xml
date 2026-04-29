@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gate sprint="tooling-v0.2">
+  <verdict>DEFER</verdict>
+  <summary>Bidirectional MLD probes show clean cluster geometry (cluster_size deltas of 1 across converged runs in all five probes) but semantic correctness is dominated by token-budget truncation rather than embedding behavior. Only P4_merge (5/5 converged, byte-equal to reference) is STABLE+CORRECT. P2_main and P5_antipode_test are STABLE but the winning candidates are either truncated JSON or implement different observable behavior than the reference. P3_apply is STABLE but ambiguous — three runs land on a verbatim reference match while three runs land on a truncated cousin of the same algorithm; AMBIGUOUS counts as INCORRECT per the gate. P1_embed_for_store fails mechanical stability (3/6 converged). Result: 1/5 STABLE+CORRECT, below the DEFER threshold of 3/5. Phase 5 (M17-M19) does not run. The geometry is promising for short functions; the bottleneck is fixed budgets b=50/200 plus a fragile JSON envelope, not the underlying embedding space.</summary>
+  <probes>
+    <probe id="1" name="P1_embed_for_store" result="FAIL" />
+    <probe id="2" name="P2_main" result="FAIL" />
+    <probe id="3" name="P3_apply" result="FAIL" />
+    <probe id="4" name="P4_merge" result="PASS" />
+    <probe id="5" name="P5_antipode_test" result="FAIL" />
+  </probes>
+</gate>

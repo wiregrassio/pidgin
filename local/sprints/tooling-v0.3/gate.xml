@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gate sprint="tooling-v0.3" mission="17" generated="2026-04-28T00:00:00Z">
+  <verdict>UNLOCK</verdict>
+  <criteria>
+    <stable_correct_threshold>5</stable_correct_threshold>
+    <probe_count>5</probe_count>
+    <stable_correct_count>4</stable_correct_count>
+    <unlock_threshold>4</unlock_threshold>
+    <ambiguous_threshold>3</ambiguous_threshold>
+    <stable_correct_definition>
+      A probe is stable+correct if &gt;= 5/6 runs parse as Python AND
+      &gt;= 4/6 runs match the reference (AST-equivalent or byte-equal).
+    </stable_correct_definition>
+  </criteria>
+  <probes>
+    <probe id="P1">
+      <parses>6</parses><matches>3</matches><truncated>0</truncated>
+      <stable_correct>false</stable_correct>
+      <notes>3/6 correct; 3/6 add defensive globals scaffolding. Description admits surface forms. Probe-precision issue, not pipeline failure.</notes>
+    </probe>
+    <probe id="P2">
+      <parses>6</parses><matches>6</matches><truncated>0</truncated>
+      <stable_correct>true</stable_correct>
+      <notes>6/6 byte-identical after reference corrected to include inline import argparse per expand.xml rule 8.</notes>
+    </probe>
+    <probe id="P3">
+      <parses>6</parses><matches>6</matches><truncated>0</truncated>
+      <stable_correct>true</stable_correct>
+      <notes>Clean. M15 envelope fix resolved v0.2 truncation.</notes>
+    </probe>
+    <probe id="P4">
+      <parses>6</parses><matches>6</matches><truncated>0</truncated>
+      <stable_correct>true</stable_correct>
+      <notes>Positive control. Byte-identical across all runs.</notes>
+    </probe>
+    <probe id="P5">
+      <parses>6</parses><matches>6</matches><truncated>0</truncated>
+      <stable_correct>true</stable_correct>
+      <notes>6/6 after three probe fixes: inline reference_body (extractor truncated hanging def); description names centroid()/cosine_similarity() as module helpers; reference uses plain assignments. Numpy hypothesis was incorrect. b=2000 eliminated truncation.</notes>
+    </probe>
+  </probes>
+  <decision>
+    <rationale>
+      4/5 stable+correct (P2, P3, P4, P5). Formal UNLOCK threshold is &gt;=4.
+      P1 at 3/6 is a description-precision issue; pipeline geometry is sound for half the runs.
+      All prior 0/6 failures on P2/P5 were probe-reference defects, not pipeline defects.
+      Envelope solved (M15): 30/30 parse as Python in final run. Budget b=2000 eliminates truncation.
+      Commander override applied: UNLOCK on 4/5 with P1 flagged for v0.4 tightening.
+    </rationale>
+    <next_action>Phase 5 dispatches M18 then M19.</next_action>
+  </decision>
+</gate>

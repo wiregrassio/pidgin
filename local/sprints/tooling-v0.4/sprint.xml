@@ -1,0 +1,2605 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sprint Plan: tooling-v0.4
+  Authored by /new-sprint against design.md and context/ on 2026-04-28.
+  Conforms to rf-edge/marionette/mission-grammar.md.
+  Phases: 5. Missions: 18. Phase 5 conditional on M6 producing 500+ converged examples.
+-->
+<sprint name="tooling-v0.4" version="1">
+  <summary>
+    Fix the operational wrapper that prevents Pidgin from surviving interrupts and
+    persisting partial results at scale (incremental writes, graceful shutdown,
+    progress tracking), consolidate to a single API provider (OpenAI), integrate
+    Pidgin into agent workflows (agent file rewrite, skills rewrite), clean up three
+    sprints of accumulated debt (project restructuring, carry-forward fixes,
+    documentation audits), and attempt a first fine-tune on converged MLD training
+    data. 18 missions across 5 phases. Phase 5 (M16-M18) conditional on M6
+    producing 500+ converged examples. Expected duration: 2-3 sprint days.
+  </summary>
+
+  <decision_points>
+    <dp id="1" default="gpt-5.4-mini-fallback">
+      Gate model fallback. If gpt-4.1-mini fails G1-G5 probes in M5, the fallback
+      is gpt-5.4-mini. If both fail, gate calls stay on claude-haiku-4-5 and the
+      Anthropic API dependency remains for v0.4. M8 (agent file rewrite) blocks on
+      M5's resolution.
+    </dp>
+    <dp id="2" default="per-batch-upsert">
+      Incremental write granularity. M1 can write per-batch (~20 functions at a time)
+      or accumulate a write queue and flush periodically. Default: per-batch (simpler,
+      matches the existing batch boundary). Commander confirms.
+    </dp>
+    <dp id="3" default="accept-reindex">
+      Identity key migration. M14 changes the identity key from absolute path to
+      relative path. Existing nests will see all functions as "new" on next index.
+      Accepted — M6 re-indexes the primary target anyway, and incremental writes (M1)
+      make re-indexing cheap.
+    </dp>
+    <dp id="4" default="conditional-on-500">
+      Fine-tuning go/no-go. M17 only dispatches if M16 reports 500+ valid examples
+      and recommends go. If M6 produces fewer than 500 converged examples, Phase 5
+      reduces to M16 + M18 only.
+    </dp>
+    <dp id="5" default="drop-if-over-budget">
+      Architecture.md deferral threshold. M15 drops if the sprint exceeds its time
+      budget. Commander decides the threshold at runtime.
+    </dp>
+  </decision_points>
+
+  <missions>
+
+    <!-- ================================================================== -->
+    <!-- Phase 1: Operational Reliability                                    -->
+    <!-- Gate: Index 50+ functions via batch, Ctrl+C mid-run, restart,      -->
+    <!-- verify partial results persisted and remaining functions resume.    -->
+    <!-- Clean shutdown message, progress output, exit 130.                 -->
+    <!-- ================================================================== -->
+
+    <mission n="1" tier="execute" review="false">
+      <context><![CDATA[
+The pipeline currently collects all results in memory and writes the nest
+only at the end of the run. Two failed runs on the OpenAI Python SDK
+(4930 functions) demonstrated the problem: Run 1 ran 40 minutes, processed
+~300 functions, then the operator Ctrl+C'd to move terminals — all results
+lost. Run 2 restarted, idempotency showed 0 unchanged / 4930 new because
+nothing persisted.
+
+The pipeline is all-or-nothing. A 27-hour job that fails at hour 26 loses
+everything.
+
+Key code locations:
+  - pidgin/pipeline/batch.py: run_embedding_mld_pipeline_for_functions()
+    orchestrates the full generate + embed pipeline. The batch path builds
+    all GenerationRequests upfront (line ~1017), submits via
+    run_batch_generation (line ~1028), then builds EmbeddingRequests for
+    all candidates (line ~1057), embeds (line ~1067), and constructs
+    FunctionMldResult objects (line ~1088). All results are returned as a
+    single list to the caller.
+  - pidgin/verbs/index.py: run() receives the full results list (line ~269),
+    then calls upsert_function_descriptions() once with all results
+    (line ~384).
+  - pidgin/store/nest.py: upsert_function_descriptions() iterates the
+    results list and upserts each to ChromaDB (line ~849).
+  - pidgin/store/sft.py: append() writes SFT records to training-data.jsonl.
+    Currently called once after all MLD completes (index.py line ~362).
+
+PD2: per-batch upsert (simpler, matches existing batch boundary).
+      ]]></context>
+
+      <objective><![CDATA[
+1. After each batch chunk completes (~100 requests, ~20 functions), upsert
+   converged results into the per-repo ChromaDB nest immediately.
+2. Write SFT training data (training-data.jsonl) incrementally — append
+   after each batch, not bulk-write at end.
+3. Generate file-level summaries per-file as that file's functions complete,
+   not in a bulk pass at the end.
+4. Verify: index 50 functions, Ctrl+C after batch 2 (~40 functions), verify
+   nest contains results from completed batches. Restart same command,
+   verify idempotency reports ~40 unchanged and ~10 new.
+      ]]></objective>
+
+      <specification><![CDATA[
+The batch path in run_embedding_mld_pipeline_for_functions currently runs
+all generation, then all embedding, then returns results. M1 restructures
+the BATCH path to process in chunk-sized increments and write after each.
+
+**Approach: per-chunk processing loop in the batch path.**
+
+The current batch path (lines ~1016-1167 in batch.py) does:
+  1. Build all GenerationRequests upfront
+  2. run_batch_generation (all at once)
+  3. Flatten drafts → candidates per function
+  4. Build all EmbeddingRequests
+  5. Embed all
+  6. Build FunctionMldResults
+
+M1 restructures this so that after each generation chunk completes (via
+_submit_chunks_pipelined, which already processes chunks sequentially),
+the pipeline immediately embeds and constructs FunctionMldResult for
+the functions in that chunk.
+
+**File: pidgin/pipeline/batch.py**
+
+Add a new function:
+
+```python
+def run_incremental_mld_pipeline(
+    functions: list[dict],
+    *,
+    converge_template: str,
+    max_batches: int,
+    convergence_threshold: float,
+    dispatch: str,
+    verbose: bool,
+    on_chunk_complete: "Callable[[list[FunctionMldResult], list[dict]], None] | None" = None,
+) -> list[FunctionMldResult]:
+```
+
+This function replaces the batch path inside
+run_embedding_mld_pipeline_for_functions. It:
+  1. Builds all GenerationRequests upfront (same as current).
+  2. Instead of calling run_batch_generation (which merges everything),
+     calls _chunk_requests to split into chunks, then processes each
+     chunk through the pipelined submitter.
+  3. After each generation chunk completes:
+     a. Flatten drafts for the functions covered by this chunk.
+     b. Build EmbeddingRequests for those candidates.
+     c. Embed them (sync for small batches, batch for large).
+     d. Construct FunctionMldResult objects for the completed functions.
+     e. Call on_chunk_complete(chunk_results, chunk_functions) if provided.
+  4. Return the full accumulated results list.
+
+The on_chunk_complete callback is how index.py hooks in to upsert and
+write SFT data after each chunk.
+
+**Mapping chunks to functions:** Each generation chunk contains requests
+with custom_id format "gen:func={fi}:call={ci}". A chunk of 100 requests
+with max_batches=5 covers 20 functions (100/5). The pipeline tracks
+which function indices (fi) are fully complete (all max_batches calls
+returned) after each chunk. Only fully-complete functions are emitted
+in on_chunk_complete.
+
+**File: pidgin/verbs/index.py**
+
+Modify run() to pass an on_chunk_complete callback to the pipeline:
+
+```python
+def _on_chunk(chunk_results, chunk_funcs):
+    # 1. Upsert to nest
+    nest.upsert_function_descriptions(
+        repo_root_abs, chunk_results, chunk_funcs,
+        file_meta=file_meta_by_rel,
+    )
+    # 2. Append SFT records
+    sft_records = _build_sft_records(chunk_results, chunk_funcs)
+    if sft_records:
+        _sft.append(repo_root_abs, sft_records)
+    # 3. File-level summary for any files now fully complete
+    _maybe_synthesise_summaries(chunk_funcs, chunk_results)
+```
+
+Extract the SFT record building logic (currently inline at lines ~318-367)
+into a helper function _build_sft_records(results, funcs) -> list[SFTRecord].
+
+Extract the file summary logic (currently at lines ~397-455) into a helper
+_maybe_synthesise_summaries(funcs, results) that checks whether all
+functions in a given file have been processed before generating the
+summary. Track completed files in a module-level or closure-scoped set.
+
+**File: pidgin/store/sft.py**
+
+No changes needed — append() already writes incrementally.
+
+**Sync path:** The sync path (_run_pipeline_sync_adaptive) processes
+one function at a time. M1 adds on_chunk_complete support there too:
+call the callback after each function completes (chunk size of 1).
+This ensures Ctrl+C resilience on the sync path as well.
+
+**Test (manual, documented in report):**
+1. Index a directory with 50+ functions using --batch.
+2. After batch 2 completes (~40 functions), Ctrl+C.
+3. Verify nest contains results: `pidgin query "test" --raw` returns hits.
+4. Restart same command. Verify idempotency: ~40 unchanged, ~10 new.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py /tmp/batch.py.m1.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py /tmp/index.py.m1.bak`
+   FAIL: HARD
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py lines 937-1167 (the batch path
+   of run_embedding_mld_pipeline_for_functions). Note how chunks are
+   submitted and results accumulated.
+3. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py lines 142-459. Note the post-MLD
+   upsert, SFT, and file summary logic.
+
+**Phase 1 — Write**
+
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Add run_incremental_mld_pipeline
+   function that processes chunks incrementally with on_chunk_complete callback.
+   FAIL: HARD
+5. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Modify
+   run_embedding_mld_pipeline_for_functions batch path to delegate to
+   run_incremental_mld_pipeline, passing on_chunk_complete=None for
+   backward compatibility when called without the callback.
+   FAIL: HARD
+6. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Add on_chunk_complete support
+   to _run_pipeline_sync_adaptive — call after each function completes.
+   FAIL: HARD
+7. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py. Extract _build_sft_records helper
+   from the inline SFT logic (lines ~318-367).
+   FAIL: HARD
+8. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py. Extract _maybe_synthesise_summaries
+   helper from the file summary logic (lines ~397-455).
+   FAIL: HARD
+9. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py. Wire the on_chunk_complete callback
+   that calls upsert, SFT append, and file summary per-chunk.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+10. RUN: `python -c "import ast; ast.parse(open('/Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py').read()); ast.parse(open('/Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py').read())"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+11. RUN: `grep -c "on_chunk_complete\|run_incremental_mld_pipeline\|_build_sft_records\|_maybe_synthesise_summaries" /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py`
+    EXPECT: at least 4 matches per file
+    FAIL: HARD
+12. RUN: `python -m pidgin --help`
+    EXPECT EXIT CODE: 0
+    FAIL: SOFT
+
+**Phase 3 — Report**
+
+13. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py, /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py.
+- Approach taken: per-batch upsert vs write queue (PD2 confirms per-batch).
+- How chunk-to-function mapping works (which fi indices complete per chunk).
+- Whether on_chunk_complete fires on both batch and sync paths.
+- Whether SFT writer was updated to write incrementally.
+- Whether file-level summaries are incremental.
+- Step results table.
+- Anomalies: any deviations from spec.
+- Rollback: `cp /tmp/batch.py.m1.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py && cp /tmp/index.py.m1.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="2" tier="execute" review="false">
+      <context><![CDATA[
+The current KeyboardInterrupt handling in the index verb produces 50+ lines
+of httpx/asyncio traceback. A `RuntimeError: Event loop is closed` async
+cleanup error from v0.3 stress tests is cosmetic but alarming. After M1
+lands incremental writes, the interrupt handler can rely on partial results
+already being persisted — it just needs to flush any in-flight data and
+exit cleanly.
+
+This mission depends on M1: the graceful shutdown path uses M1's
+incremental write mechanism to ensure whatever results have been collected
+are already in the nest. The interrupt handler's job is to suppress
+tracebacks and print a clean summary.
+
+Key code locations:
+  - pidgin/verbs/index.py: run() is the top-level entry point. The
+    KeyboardInterrupt must be caught here.
+  - pidgin/pipeline/batch.py: _submit_chunks_pipelined() has a polling
+    loop (line ~439) that sleeps and polls. KeyboardInterrupt during
+    time.sleep() propagates up.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Catch KeyboardInterrupt at the top level of the index verb.
+2. On interrupt: do not wait for in-flight batch polling. Print a clean
+   one-line summary. Exit 130 (standard SIGINT exit code).
+3. Suppress the RuntimeError: Event loop is closed async cleanup error.
+4. After M2, Ctrl+C during an index run produces exactly one summary line
+   and no traceback.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File: pidgin/verbs/index.py**
+
+Wrap the live-mode body of run() (everything after the dry-run early
+return, from the imports at line ~164 through the return 0 at line ~459)
+in a try/except KeyboardInterrupt block:
+
+```python
+try:
+    # ... existing live-mode body ...
+except KeyboardInterrupt:
+    # M1's incremental writes mean partial results are already persisted.
+    # Count what we have.
+    n_written = _chunk_write_count  # closure variable from the callback
+    n_total = len(to_mld) if 'to_mld' in dir() else len(funcs)
+    print(
+        f"\nInterrupted. Wrote {n_written}/{n_total} functions to nest. "
+        f"Resume with the same command to continue.",
+        file=sys.stderr,
+    )
+    sys.exit(130)
+```
+
+The _chunk_write_count variable is incremented by the on_chunk_complete
+callback from M1. If the interrupt happens before any chunks complete,
+it will be 0.
+
+**Suppress async cleanup errors:**
+
+At the module level of index.py (or in the except block), add:
+
+```python
+import warnings
+warnings.filterwarnings("ignore", message=".*Event loop is closed.*")
+```
+
+Alternatively, catch RuntimeError in a top-level atexit handler that
+checks for "Event loop is closed" in the message. The simpler approach
+(warnings filter) is preferred — it's one line and catches the specific
+cosmetic error without masking real RuntimeErrors.
+
+**File: pidgin/pipeline/batch.py**
+
+In _submit_chunks_pipelined, the time.sleep(poll_interval_s) at line ~440
+is where KeyboardInterrupt most commonly fires during polling. No change
+needed here — let the exception propagate to the index verb's handler.
+Do NOT add a local try/except in batch.py — that would mask the interrupt
+from the verb layer.
+
+**Test (manual, documented in report):**
+1. Start `pidgin index <path> --batch` on a directory with 50+ functions.
+2. Ctrl+C during batch polling.
+3. Observe: one summary line, no traceback, exit code 130.
+4. Restart same command. Verify resume (idempotency from M1).
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py /tmp/index.py.m2.bak`
+   FAIL: HARD
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py. Note the current structure of
+   run() and where the live-mode body begins.
+
+**Phase 1 — Write**
+
+3. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py. Add the KeyboardInterrupt handler
+   wrapping the live-mode body. Include the _chunk_write_count tracking
+   variable (initialized to 0, incremented by the on_chunk_complete
+   callback from M1).
+   FAIL: HARD
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py. Add the warnings filter for
+   "Event loop is closed" at module level.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+5. RUN: `python -c "import ast; ast.parse(open('/Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+6. RUN: `grep -n "KeyboardInterrupt\|exit(130)\|Event loop is closed" /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py`
+   EXPECT: at least 3 matches
+   FAIL: HARD
+
+**Phase 3 — Report**
+
+7. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py.
+- Exact location of the KeyboardInterrupt handler (line numbers).
+- How async cleanup errors are suppressed (warnings filter vs atexit).
+- How _chunk_write_count is threaded from the on_chunk_complete callback.
+- Step results table.
+- Anomalies.
+- Rollback: `cp /tmp/index.py.m2.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="3" tier="execute" review="false">
+      <context><![CDATA[
+The pipeline currently produces no output during long index runs. A 27-hour
+batch job gives zero feedback until completion. M3 adds progress tracking
+at the batch pipeline level.
+
+This mission has no code dependency on M1/M2, but should be tested after
+M1 lands so progress lines interleave with incremental write notifications.
+
+Key code locations:
+  - pidgin/pipeline/batch.py: _submit_chunks_pipelined() is the pipeline
+    loop (lines ~342-460). It already knows chunk boundaries — it just
+    doesn't emit anything. run_embedding_mld_pipeline_for_functions()
+    calls it.
+  - pidgin/cli.py: --verbose flag is already wired as a shared flag
+    (line ~44).
+      ]]></context>
+
+      <objective><![CDATA[
+1. After each batch chunk completes, print a progress line to stderr.
+2. On batch submission, print a submission line to stderr.
+3. In --verbose mode, print per-function results as they arrive.
+4. Time estimates should be within 2x of actual after the first 3 batches.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File: pidgin/pipeline/batch.py**
+
+Add a progress callback parameter to _submit_chunks_pipelined:
+
+```python
+def _submit_chunks_pipelined(
+    client,
+    chunks: list,
+    *,
+    endpoint: str,
+    description: str,
+    max_concurrent: int = BATCH_MAX_CONCURRENT_CHUNKS,
+    poll_interval_s: float = 30.0,
+    on_progress: "Callable[[dict], None] | None" = None,
+) -> list:
+```
+
+The on_progress callback receives a dict with keys:
+  - event: "submitted" | "completed" | "failed"
+  - chunk_index: int
+  - n_chunks: int
+  - elapsed_s: float (seconds since first submission)
+
+Add progress emission inside the pipeline loop:
+
+1. When submitting a chunk (in _submit_chunk), call on_progress with
+   event="submitted".
+2. When a chunk reaches terminal status, call on_progress with
+   event="completed" (or "failed" if status != "completed").
+
+**File: pidgin/pipeline/batch.py (continued)**
+
+Add a module-level progress printer that formats the output:
+
+```python
+import time as _time
+
+def _default_progress_printer(info: dict) -> None:
+    """Print batch progress to stderr."""
+    event = info["event"]
+    ci = info["chunk_index"] + 1
+    nc = info["n_chunks"]
+    elapsed = info["elapsed_s"]
+
+    if event == "submitted":
+        print(f"[batch {ci}/{nc}] submitted, polling...", file=sys.stderr)
+    elif event == "completed":
+        # Estimate remaining time from average chunk completion rate.
+        avg_per_chunk = elapsed / ci if ci > 0 else 0
+        remaining_chunks = nc - ci
+        eta_s = avg_per_chunk * remaining_chunks
+        eta_str = _format_eta(eta_s)
+        print(
+            f"[batch {ci}/{nc}] completed | ~{eta_str} remaining",
+            file=sys.stderr,
+        )
+    elif event == "failed":
+        print(f"[batch {ci}/{nc}] FAILED", file=sys.stderr)
+```
+
+Add a helper _format_eta(seconds) -> str that formats seconds as
+"Xh Ym" or "Ym Zs".
+
+**File: pidgin/pipeline/batch.py (continued)**
+
+In run_embedding_mld_pipeline_for_functions (and in
+run_incremental_mld_pipeline from M1), thread the on_progress callback
+through to _submit_chunks_pipelined. Use _default_progress_printer when
+no custom callback is provided.
+
+**Function-level progress in index.py:**
+
+In the on_chunk_complete callback from M1, after each chunk is processed,
+print a progress line:
+
+```
+[batch 3/247] 300/4930 functions | 215 converged (71.7%) | ~4h 12m remaining
+```
+
+This line is computed from the accumulated results count, total function
+count, converged count, and elapsed time.
+
+**Verbose per-function output:**
+
+When --verbose is set, after each function's MLD result is constructed in
+the chunk processing, print:
+
+```
+  ✓ create (converged, cluster=8, tightness=0.94)
+  ✗ AsyncChat (not converged, cluster=3)
+```
+
+This goes in the on_chunk_complete callback in index.py, gated on the
+verbose flag.
+
+**Test (manual):**
+1. Run `pidgin index <dir> --batch` on 50+ functions.
+2. Observe batch-by-batch progress with submission and completion lines.
+3. After 3+ batches, verify time estimate is within 2x of actual.
+4. Run with --verbose, observe per-function output.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py /tmp/batch.py.m3.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py /tmp/index.py.m3.bak`
+   FAIL: HARD
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py lines 342-460
+   (_submit_chunks_pipelined). Note the submission and polling loop.
+
+**Phase 1 — Write**
+
+3. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Add on_progress parameter to
+   _submit_chunks_pipelined and emit callbacks on submit and terminal.
+   FAIL: HARD
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Add _default_progress_printer
+   and _format_eta helper.
+   FAIL: HARD
+5. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Thread on_progress through
+   run_batch_generation and run_incremental_mld_pipeline.
+   FAIL: HARD
+6. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py. Add function-level progress and
+   verbose per-function output to the on_chunk_complete callback.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+7. RUN: `python -c "import ast; ast.parse(open('/Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py').read()); ast.parse(open('/Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+8. RUN: `grep -c "on_progress\|_default_progress_printer\|_format_eta" /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py`
+   EXPECT: >= 5 matches
+   FAIL: HARD
+
+**Phase 3 — Report**
+
+9. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py, /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py.
+- Where progress emission was added (line numbers in batch.py).
+- Whether --verbose per-function output works.
+- Sample output format from the progress lines.
+- Step results table.
+- Anomalies.
+- Rollback: `cp /tmp/batch.py.m3.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py && cp /tmp/index.py.m3.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py`.
+      ]]></report>
+    </mission>
+
+    <!-- Phase 1 Gate: All M1-M3 GREEN. Ctrl+C resilience verified. -->
+    <!-- ================================================================== -->
+    <!-- Phase 2: Scale and Consolidation                                    -->
+    <!-- Gate: Class methods extractable, gate model decided, 500+ converged -->
+    <!-- examples in training-data.jsonl, abandoned batch recovery operational.-->
+    <!-- ================================================================== -->
+
+    <mission n="4" tier="execute" review="false">
+      <context><![CDATA[
+The AST parser (pidgin/utils/parser.py) only extracts module-level `def`
+statements and top-level class definitions. Three OpenAI SDK subdirectories
+(embeddings, files, batches) returned zero functions because they are
+class-based — public methods are inside class bodies but the parser's
+_python_record() (line ~189) walks ast.walk(tree), which visits all nodes
+including class methods, but parse_python() does not distinguish class
+methods from module-level defs. The actual problem is that _python_record
+skips private names (starting with _) and extracts both top-level and
+nested functions — but class methods appear with their bare names (e.g.
+"create"), not qualified (e.g. "Embeddings.create"). This means:
+1. Class methods DO get extracted, but their name collides with methods
+   from other classes.
+2. The module field degrades to basename (e.g. "parser.py" instead of
+   "pidgin/utils/parser.py") when called on individual files.
+
+M4 fixes: (a) class method identity uses ClassName.method_name, (b) module
+field uses relative path from repo root, (c) single-file indexing works
+via walk_source_files.
+
+Key code locations:
+  - pidgin/utils/parser.py: parse_python() at line ~171, _python_record()
+    at line ~189, extract_public_functions() at line ~554,
+    walk_source_files() at line ~39.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Modify parse_python to walk class bodies and extract public methods
+   with ClassName.method_name identity.
+2. Exclude __dunder__ methods except __init__ (if it has meaningful logic
+   beyond assignment).
+3. Fix the module field to use relative path from repo root.
+4. Verify single-file indexing works via walk_source_files.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File: pidgin/utils/parser.py**
+
+**Change 1: Class method extraction in parse_python (line ~171)**
+
+Replace the current ast.walk approach with a two-pass extraction:
+
+```python
+def parse_python(source: str, module_path: str) -> list[FunctionRecord]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    lines = source.splitlines()
+    records: list[FunctionRecord] = []
+
+    for node in ast.iter_child_nodes(tree):
+        # Module-level functions
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            rec = _python_record(node, lines, module_path, class_name=None)
+            if rec is not None:
+                records.append(rec)
+        # Classes: extract public methods
+        elif isinstance(node, ast.ClassDef):
+            # Add a record for the class itself
+            class_rec = _python_record(node, lines, module_path, class_name=None)
+            if class_rec is not None:
+                records.append(class_rec)
+            # Extract methods
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    method_rec = _python_record(
+                        child, lines, module_path,
+                        class_name=node.name,
+                    )
+                    if method_rec is not None:
+                        records.append(method_rec)
+
+    return records
+```
+
+**Change 2: Update _python_record to accept class_name (line ~189)**
+
+```python
+def _python_record(
+    node, lines: list[str], module_path: str,
+    class_name: str | None = None,
+) -> "FunctionRecord | None":
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return None
+
+    name = node.name
+
+    # For class methods: qualify with ClassName.method_name
+    if class_name is not None:
+        # Skip private methods (leading _) except __init__
+        if name.startswith("_") and name != "__init__":
+            return None
+        # Skip __dunder__ methods except __init__
+        if name.startswith("__") and name.endswith("__") and name != "__init__":
+            return None
+        # __init__: only keep if body has meaningful logic beyond assignment
+        if name == "__init__":
+            if not _init_has_meaningful_logic(node):
+                return None
+        name = f"{class_name}.{name}"
+    else:
+        # Module-level: skip private names as before
+        if name.startswith("_") and name != "__init__":
+            return None
+
+    # ... rest unchanged (start, end, signature, body, visibility, return)
+```
+
+**Change 3: Add __init__ logic checker**
+
+```python
+def _init_has_meaningful_logic(node) -> bool:
+    """Return True if __init__ body contains logic beyond self.x = x assignments.
+
+    Checks for: function calls (not super().__init__), control flow (if/for/while/try),
+    list comprehensions, or any statement that is not a simple assignment.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.If, ast.For, ast.While, ast.Try, ast.With)):
+            return True
+        if isinstance(child, ast.Expr) and isinstance(child.value, ast.Call):
+            # Allow super().__init__() but flag other calls
+            func = child.value.func
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Call):
+                continue  # super().__init__()
+            return True
+    return False
+```
+
+**Change 4: Fix module field in extract_public_functions (line ~554)**
+
+The current code at line ~592 computes module_path relative to the file's
+parent (for single files) or root (for directories). The problem is
+single-file mode uses file_path.parent, which gives just the basename.
+
+Fix: always compute module_path relative to the repo root (found via
+find_project_root), falling back to the current behaviour if no git root
+exists.
+
+```python
+from pidgin.utils.git import find_project_root
+
+# In extract_public_functions, replace the module_path computation:
+repo_root = find_project_root(str(root))
+if repo_root:
+    repo_root_p = Path(repo_root)
+else:
+    repo_root_p = root.parent if root.is_file() else root
+
+for file_path in sorted(candidates):
+    # ...
+    try:
+        module_path = str(file_path.relative_to(repo_root_p))
+    except ValueError:
+        module_path = str(file_path)
+```
+
+**Change 5: walk_source_files single-file handling**
+
+walk_source_files already handles single files (CF4 guard at line ~60).
+Verify it works and document in the report. No code change expected.
+
+**Test:**
+1. Run `pidgin index` on openai-python/src/openai/resources/embeddings/
+   and verify >0 functions extracted.
+2. Run on a single .py file and verify results.
+3. Verify class methods appear with ClassName.method_name identity.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py /tmp/parser.py.m4.bak`
+   FAIL: HARD
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py lines 171-221 (parse_python and
+   _python_record). Note current extraction logic.
+3. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py lines 554-613
+   (extract_public_functions). Note module_path computation.
+
+**Phase 1 — Write**
+
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py. Rewrite parse_python to use
+   ast.iter_child_nodes with class body method extraction.
+   FAIL: HARD
+5. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py. Update _python_record to accept
+   class_name parameter and implement ClassName.method_name identity.
+   Add _init_has_meaningful_logic helper.
+   FAIL: HARD
+6. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py. Fix module_path in
+   extract_public_functions to use find_project_root.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+7. RUN: `python -c "import ast; ast.parse(open('/Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+8. RUN: `python -c "
+from pidgin.utils.parser import parse_python
+src = '''
+class Foo:
+    def bar(self): pass
+    def _private(self): pass
+    def __repr__(self): pass
+    def __init__(self):
+        self.x = 1
+'''
+recs = parse_python(src, 'test.py')
+names = [r.name for r in recs]
+print(names)
+assert 'Foo.bar' in names, f'missing Foo.bar: {names}'
+assert 'Foo._private' not in names, f'has private: {names}'
+assert 'Foo.__repr__' not in names, f'has dunder: {names}'
+print('PASS')
+"`
+   EXPECT CONTAINS: PASS
+   FAIL: HARD
+9. RUN: `python -c "
+from pidgin.utils.parser import extract_public_functions
+import tempfile, os
+d = tempfile.mkdtemp()
+os.makedirs(os.path.join(d, '.git'))
+with open(os.path.join(d, 'test.py'), 'w') as f:
+    f.write('class A:\\n    def method(self): pass\\ndef top(): pass\\n')
+funcs = extract_public_functions(os.path.join(d, 'test.py'))
+names = [fn['name'] for fn in funcs]
+print(names)
+assert 'A.method' in names
+assert 'top' in names
+print('PASS')
+"`
+   EXPECT CONTAINS: PASS
+   FAIL: HARD
+
+**Phase 3 — Report**
+
+10. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py.
+- How many functions the three previously-empty SDK subdirectories now
+  yield (if an openai-python checkout is available for testing; otherwise
+  report the class method extraction test results).
+- Identity format for class methods: ClassName.method_name confirmed.
+- Whether single-file indexing works.
+- __init__ filtering logic: what counts as "meaningful logic."
+- Step results table.
+- Anomalies.
+- Rollback: `cp /tmp/parser.py.m4.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/parser.py`.
+      ]]></report>
+    </mission>
+
+    <mission n="5" tier="reason" review="false">
+      <context><![CDATA[
+All API calls are consolidating to OpenAI in v0.4. The gate validation
+currently uses claude-haiku-4-5 via the Anthropic API (run_anthropic_batch
+in pidgin/pipeline/batch.py). M5 tests whether gpt-4.1-mini can replace
+haiku for gate calls, using the G1-G5 probes from v0.2 M4.
+
+The gate probes test bidirectional MLD validation:
+  G1: embed_for_store — valid description, should pass
+  G2: parse CLI arguments — valid, should pass
+  G3: merge delta into state — valid, should pass
+  G4: merge dictionaries — valid, should pass
+  G5: merge delta (truncated with trailing comma) — invalid, should fail
+
+Gate prompt: pidgin/prompts/gate.xml. Response schema: {valid: bool, reason: str}.
+
+This is reason-tier because the agent must interpret ambiguous probe
+results and make a judgment call on "matches accuracy." A 4/5 match
+is clear. A 3/5 with different failure modes requires analysis.
+
+If gpt-4.1-mini fails, the fallback is gpt-5.4-mini (PD1).
+      ]]></context>
+
+      <objective><![CDATA[
+1. Run G1-G5 gate probes against gpt-4.1-mini.
+2. Compare accuracy against the claude-haiku-4-5 baseline (4/5 expected).
+3. If gpt-4.1-mini matches haiku accuracy (4/5 or better), recommend it.
+4. If gpt-4.1-mini fails, run probes against gpt-5.4-mini as fallback.
+5. Produce a clear recommendation with accuracy numbers.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Probe Setup:**
+
+Read pidgin/prompts/gate.xml. Use assemble_xml_prompt from
+pidgin/prompts/templates.py to assemble the gate prompt with the
+function body and candidate description filled into the payload
+placeholders.
+
+The 5 probe cases (from v0.2 M4 design):
+
+G1: function=embed_for_store (pidgin/utils/api.py)
+    candidate="Call embed_text with the store model and default dimension, then return the raw embedding list."
+    expected: valid=true
+
+G2: function=main (pidgin/cli.py)
+    candidate="Parse CLI arguments for text, then print the embedding vector for the input."
+    expected: valid=true
+
+G3: function=merge (hypothetical, use: "def merge(state, delta): result = dict(state); result.update(delta); del result['_temp']; return result")
+    candidate="Merge delta into a copy of state, remove the _temp key, and return the merged dict."
+    expected: valid=true
+
+G4: function=merge2 (hypothetical, use: "def merge2(a, b): return {**a, **b}")
+    candidate="Merge dictionaries a and b, prioritizing b's values on key conflicts."
+    expected: valid=true
+
+G5: function=merge (same as G3)
+    candidate="Merge delta into a copy of state,"
+    expected: valid=false (trailing comma — truncated)
+
+**Execution:**
+
+For each probe, call the OpenAI chat completions API (NOT the batch API —
+this is a small-scale experiment) with:
+  - model: "gpt-4.1-mini"
+  - system: gate.xml preamble (from assemble_xml_prompt.cached_preamble)
+  - user: gate.xml payload (from assemble_xml_prompt.payload)
+  - response_format: json_schema with {valid: bool, reason: str}
+
+Parse the response. Record valid/reason for each probe.
+
+If gpt-4.1-mini scores < 4/5:
+  Re-run all 5 probes with model="gpt-5.4-mini" (reasoning model).
+  Note: gpt-5.4-mini may require different handling (reasoning models
+  may not support json_schema response_format — check the API response
+  and fall back to parsing JSON from the text output if needed).
+
+**Analysis:**
+
+Compare per-probe results. The recommendation is:
+  - gpt-4.1-mini at 4/5 or better → recommend gpt-4.1-mini
+  - gpt-4.1-mini < 4/5, gpt-5.4-mini at 4/5 → recommend gpt-5.4-mini
+  - both < 4/5 → recommend staying on claude-haiku-4-5 (PD1 fallback)
+
+Document any behavioral differences: does one model fail on edge cases
+the other handles? Does reasoning-model output differ structurally?
+
+**No code changes in this mission.** This is a probe-and-report mission.
+M8 will act on the recommendation.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Setup**
+
+1. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/gate.xml to understand the prompt structure
+   and placeholder names.
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/utils/api.py to find the embed_for_store function
+   body (for probe G1).
+3. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/cli.py to find the main function body (for G2).
+
+**Phase 1 — Probe gpt-4.1-mini**
+
+4. RUN: For each probe G1-G5, construct the gate prompt using
+   assemble_xml_prompt and call the OpenAI API with model=gpt-4.1-mini.
+   Record valid/reason for each.
+   FAIL: SOFT (API errors are recoverable — retry once)
+5. Tabulate results: probe ID, expected, actual valid, reason excerpt.
+   Count matches.
+
+**Phase 2 — Fallback (conditional)**
+
+6. If gpt-4.1-mini scored < 4/5: re-run G1-G5 with model=gpt-5.4-mini.
+   Record results.
+   FAIL: SOFT
+
+**Phase 3 — Analysis and Report**
+
+7. Compare results across models. Produce recommendation.
+8. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Per-probe pass/fail table for each model tested:
+  | Probe | Expected | gpt-4.1-mini valid | gpt-4.1-mini reason | [gpt-5.4-mini valid] | [gpt-5.4-mini reason] |
+- Total accuracy for each model.
+- Recommendation: which model replaces haiku for gate calls.
+- Behavioral differences observed.
+- If gpt-5.4-mini was tested: any structural differences in output
+  (e.g., reasoning tokens, different JSON handling).
+- M8 dependency: the winning model name for agent file references.
+      ]]></report>
+    </mission>
+
+    <mission n="6" tier="execute" review="false">
+      <context><![CDATA[
+The end-to-end proof that Phase 1 works at scale. With class method
+extraction from M4, the full OpenAI Python SDK should yield 4930+
+functions. With incremental writes from M1, graceful shutdown from M2,
+and progress tracking from M3, this run should be operationally survivable.
+
+This mission depends on M1, M2, M3, and M4 all being GREEN.
+
+The mission succeeds when training-data.jsonl contains 500+ converged
+examples. Based on the sync runs (91% and 63% convergence rates on
+chat/ and responses/), 4930 functions should produce 3000+ converged
+examples.
+
+Key: the openai-python repository must be available locally. It should
+be at a sibling path or the operator specifies the path. The --exclude
+"*/types/*" flag filters out the auto-generated type stubs.
+
+Any operational issues discovered here are carry-forwards, not blockers.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Index the full OpenAI Python SDK (openai-python, --exclude "*/types/*")
+   using the batch path.
+2. Produce 500+ converged examples in .pidgin/training-data.jsonl.
+3. Document any interruptions and recovery behavior.
+4. Report total functions, convergence rate, wall time, and operational
+   issues.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Execution:**
+
+```bash
+pidgin index <path-to-openai-python>/src/openai --batch --exclude "*/types/*" --verbose
+```
+
+The --verbose flag enables per-function status lines (M3) and progress
+tracking.
+
+**Expected behavior:**
+- Progress lines appear after each batch chunk completes (M3).
+- Incremental writes persist results after each chunk (M1).
+- If interrupted and resumed, idempotency reports unchanged/new split (M1).
+- Exit is clean on Ctrl+C with one summary line (M2).
+
+**Success criterion:** 500+ converged examples in
+<openai-python>/.pidgin/training-data.jsonl.
+
+**If the openai-python repo is not available:**
+Clone it: `git clone https://github.com/openai/openai-python.git /tmp/openai-python`
+The repo is public and ~50MB.
+
+**If the run needs to be interrupted and resumed:** That is fine and
+expected — document each interruption, how many functions were persisted,
+and whether recovery worked correctly.
+
+**Wall time estimate:** At ~30s per batch chunk of 100 requests, with
+4930 functions × 5 calls = 24650 requests = 247 chunks, the batch API
+submission takes ~2 hours. Polling adds overhead. Total estimate: 3-5
+hours for the full run.
+
+**Carry-forwards:** Any operational issues discovered (timeouts, unexpected
+errors, memory usage) are documented as carry-forwards for M14 or v0.5.
+They do not block this mission — the mission succeeds on the training
+data criterion.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Setup**
+
+1. Verify openai-python is available. If not:
+   RUN: `git clone https://github.com/openai/openai-python.git /tmp/openai-python`
+   FAIL: HARD
+2. RUN: `pidgin index /tmp/openai-python/src/openai --dry-run --exclude "*/types/*"`
+   EXPECT: function count > 1000
+   FAIL: SOFT (if < 1000, M4 class extraction may not be working)
+
+**Phase 1 — Index**
+
+3. RUN: `pidgin index /tmp/openai-python/src/openai --batch --exclude "*/types/*" --verbose`
+   EXPECT: progress output during run
+   FAIL: SOFT (interruption is acceptable; restart and continue)
+4. If interrupted: restart the same command. Verify idempotency.
+   EXPECT: some functions reported as "unchanged"
+   FAIL: SOFT
+
+**Phase 2 — Verify**
+
+5. RUN: `wc -l /tmp/openai-python/.pidgin/training-data.jsonl`
+   EXPECT: >= 500 lines
+   FAIL: HARD (this is the primary success criterion)
+6. RUN: `pidgin query "embedding" --raw` (from the openai-python directory)
+   EXPECT: returns results (nest is queryable)
+   FAIL: SOFT
+
+**Phase 3 — Report**
+
+7. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Total functions discovered.
+- Total converged.
+- Convergence rate (%).
+- Wall time.
+- Any interruptions and recovery behavior.
+- Final training-data.jsonl line count.
+- Operational issues observed (carry-forwards for M14 or v0.5).
+- Progress output sample (first and last few lines).
+      ]]></report>
+    </mission>
+
+    <mission n="7" tier="execute" review="false">
+      <context><![CDATA[
+Before starting a new index run, Pidgin should check for completed OpenAI
+batches from prior runs that were abandoned (e.g., Ctrl+C before polling
+finished). Pidgin already encodes function name + call index in custom_id
+format "gen:func={fi}:call={ci}". Completed batches from prior runs may
+contain usable results.
+
+This mission depends on M1 (incremental writes — recovery results feed
+through the same write path).
+
+Key code locations:
+  - pidgin/pipeline/batch.py: _submit_chunks_pipelined() creates batches
+    with client.batches.create(). The custom_id format is set in
+    _build_converge_request (line ~818): "gen:func={fi}:call={ci}".
+  - OpenAI Batch API: client.batches.list() returns recent batches.
+    Each batch has status, input_file_id, output_file_id.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Before starting new batch submissions, list recent completed batches
+   (last 24h) via the OpenAI Batch API.
+2. Check if any custom_ids match functions in the current run's to-index
+   list.
+3. If matches found, download results and process them through the
+   existing converge → embed → upsert path.
+4. Proceed with remaining unprocessed functions.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File: pidgin/pipeline/batch.py**
+
+Add a recovery function:
+
+```python
+def recover_abandoned_batches(
+    client,
+    function_custom_ids: set[str],
+    *,
+    max_age_hours: int = 24,
+) -> list[dict]:
+    """Check for completed OpenAI batches from prior runs.
+
+    Lists recent batches (completed status, within max_age_hours),
+    downloads their output, and returns raw result dicts whose
+    custom_id is in function_custom_ids.
+
+    Returns an empty list if no matches found.
+    Edge cases (partial matches, corrupted results) fail soft —
+    log and skip, do not raise.
+    """
+```
+
+Implementation:
+1. Call client.batches.list(limit=100) — returns the most recent batches.
+2. Filter by: status == "completed", created_at within max_age_hours.
+3. For each matching batch:
+   a. Download output file via client.files.content(batch.output_file_id).
+   b. Parse JSONL lines.
+   c. For each line, check if custom_id is in function_custom_ids.
+   d. Collect matching result dicts.
+4. Return collected dicts.
+
+Error handling: wrap each batch download in try/except. Log errors to
+stderr and continue. A corrupted or inaccessible batch should not block
+the new run.
+
+**File: pidgin/pipeline/batch.py (continued)**
+
+In run_incremental_mld_pipeline (from M1) or
+run_embedding_mld_pipeline_for_functions, add recovery at the start
+of the batch path:
+
+```python
+# Before building GenerationRequests, check for abandoned batches.
+all_custom_ids = {
+    f"gen:func={fi}:call={ci}"
+    for fi in range(n_funcs) for ci in range(max_batches)
+}
+recovered = recover_abandoned_batches(client, all_custom_ids)
+if recovered:
+    # Process recovered results through the same parse → embed path.
+    # Remove recovered function indices from the to-generate set.
+    ...
+```
+
+The recovered results feed into the same parse_batch_results →
+embed → FunctionMldResult construction path as normal results.
+Functions that are fully recovered (all max_batches calls present)
+skip generation entirely. Partially recovered functions still submit
+the missing calls.
+
+**Test:**
+1. Submit a batch via `pidgin index <path> --batch` on a small directory.
+2. Kill Pidgin before it polls for results (Ctrl+C immediately after
+   "submitted, polling...").
+3. Wait ~60s for the batch to complete server-side.
+4. Restart the same command.
+5. Verify: recovery downloads and applies the completed batch results
+   before submitting new batches. Progress output should show recovered
+   functions.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py /tmp/batch.py.m7.bak`
+   FAIL: HARD
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Identify where batch creation
+   happens and the custom_id format.
+
+**Phase 1 — Write**
+
+3. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Add recover_abandoned_batches
+   function.
+   FAIL: HARD
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py. Wire recovery into the batch
+   path of run_incremental_mld_pipeline (or
+   run_embedding_mld_pipeline_for_functions).
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+5. RUN: `python -c "import ast; ast.parse(open('/Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py').read())"`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+6. RUN: `grep -c "recover_abandoned_batches" /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py`
+   EXPECT: >= 2 (definition + call site)
+   FAIL: HARD
+
+**Phase 3 — Report**
+
+7. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py.
+- How batch discovery works (API call, filtering).
+- What the custom_id matching logic is.
+- How partial matches are handled (some calls recovered, others not).
+- Kill/restart test results (if manual test was feasible).
+- Step results table.
+- Anomalies.
+- Rollback: `cp /tmp/batch.py.m7.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/batch.py`.
+      ]]></report>
+    </mission>
+
+    <!-- Phase 2 Gate: Class methods extractable, gate model decided, -->
+    <!-- 500+ converged examples, abandoned batch recovery operational. -->
+    <!-- ================================================================== -->
+    <!-- Phase 3: Integration                                                -->
+    <!-- Gate: Agent files updated with correct model references and Pidgin  -->
+    <!-- instructions. Skills rewritten to use Pidgin verbs. No skill        -->
+    <!-- imports from tools/ for anything Pidgin provides.                   -->
+    <!-- ================================================================== -->
+
+    <mission n="8" tier="reason" review="true">
+      <context><![CDATA[
+One-shot rewrite of the Execute/Reason/Scout agent files by Opus. The
+agent files live at .claude/agents/{execute.md, reason.md, scout.md}.
+There is also .claude/agents/CLAUDE.md as a discovery index.
+
+Three changes per file:
+1. Update model references based on M5's gate experiment result (the
+   winning model replaces any haiku references in agent instructions).
+2. Add Pidgin tool instructions for agent awareness.
+3. Trim instructions using prompting best practices.
+
+This mission depends on M5: the report from M5 tells us which model
+replaces claude-haiku-4-5 for gate calls. The agent reads M5's log entry
+to determine the winning model name.
+
+The review context receives the original and rewritten files. Review
+criteria: are model references correct per M5? Are Pidgin instructions
+actionable? Did trimming remove anything load-bearing?
+      ]]></context>
+
+      <objective><![CDATA[
+1. Rewrite .claude/agents/execute.md with updated model references,
+   Pidgin instructions, and trimmed language.
+2. Rewrite .claude/agents/reason.md with the same changes.
+3. Rewrite .claude/agents/scout.md with the same changes.
+4. Do NOT restructure the Execute/Reason/Scout taxonomy.
+5. Do NOT change the tier definitions.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Pre-read:** Before editing, read M5's log entry to determine which
+model won the gate experiment. Use that model name in all references.
+
+**Change 1: Model references**
+
+In each agent file, find any reference to claude-haiku-4-5 or
+claude-haiku-4-5-20251001 for direct API calls (not for Claude Code
+subscription usage — those stay as-is). Replace with the M5 winner.
+
+Do NOT change references to:
+- claude-opus-4-7 (selection model)
+- claude-sonnet-4-6 (sprint execution via Claude Code)
+- gpt-4.1-nano (generation model)
+
+**Change 2: Pidgin instructions**
+
+Add a Pidgin tool section to each agent file. The exact text:
+
+```markdown
+## Pidgin
+
+Before modifying code, run `pidgin query` and `pidgin depends` for
+context. After modifying code, run `pidgin index --sync` on changed files.
+```
+
+Place this section after the existing tool/capability sections, before
+any closing notes.
+
+**Change 3: Trim**
+
+Apply prompting best practices:
+- Add XML tags at structural boundaries (## sections → keep as markdown
+  headers; they already serve as structure).
+- Cut redundant phrases. Remove "Note that" / "Please note" / "It is
+  important to" / "Make sure to" when the instruction stands alone.
+- Tighten language: prefer imperative ("Do X") over passive ("X should
+  be done").
+- Do NOT remove content that defines behavior, constraints, or
+  decision-making criteria. Trimming targets verbosity, not substance.
+
+**Review criteria (for the separate review agent):**
+1. Are model references correct per M5's recommendation?
+2. Are Pidgin instructions present in all three files?
+3. Did trimming remove anything load-bearing? (Compare before/after
+   for each file — any section that disappeared or shrank by >50%
+   warrants a CONCERN.)
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/execute.md /tmp/execute.md.m8.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/reason.md /tmp/reason.md.m8.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/scout.md /tmp/scout.md.m8.bak`
+   FAIL: HARD
+2. Read M5's log entry from /Users/elliotwillis/Desktop/fe-toolkit/local/sprints/tooling-v0.4/log.md
+   to determine the winning gate model.
+3. Read /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/execute.md, reason.md, scout.md.
+
+**Phase 1 — Write**
+
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/execute.md with all three changes.
+   FAIL: HARD
+5. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/reason.md with all three changes.
+   FAIL: HARD
+6. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/scout.md with all three changes.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+7. RUN: `grep -l "pidgin query\|pidgin depends\|pidgin index" /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/*.md`
+   EXPECT: 3 files
+   FAIL: HARD
+8. RUN: `grep -c "claude-haiku-4-5" /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/execute.md /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/reason.md /Users/elliotwillis/Desktop/fe-toolkit/.claude/agents/scout.md`
+   EXPECT: 0 matches (haiku references should be replaced)
+   FAIL: SOFT (may have legitimate non-gate references)
+
+**Phase 3 — Report**
+
+9. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Files modified: .claude/agents/execute.md, reason.md, scout.md.
+- Which model references changed (from → to).
+- The Pidgin instruction block added (verbatim).
+- What was trimmed (summary per file).
+- Line count before/after for each file.
+- Step results table.
+- Anomalies: any references that were ambiguous (gate vs subscription).
+- Rollback: 3-file `cp /tmp/...m8.bak` sequence.
+      ]]></report>
+    </mission>
+
+    <mission n="9" tier="execute" review="false">
+      <context><![CDATA[
+Three skills are rewritten to use Pidgin verbs: digest, embed, finalize.
+Two skills get a review pass: new-sprint and run-sprint. Dissect is
+deferred to v0.5.
+
+After this mission, no skill imports from tools/ for anything Pidgin
+provides. Any remaining tools/ dependencies are non-Pidgin functionality.
+
+Skill files are in .claude/skills/:
+  - digest/SKILL.md — currently uses tools/ for MLD indexing
+  - embed/SKILL.md — currently uses tools/ for embedding
+  - finalize/SKILL.md — currently uses tools/ for indexing + egg
+  - new-sprint/SKILL.md — sprint plan creation
+  - run-sprint/SKILL.md — sprint execution
+
+This mission depends on M4 (class methods enable full Pidgin surface).
+
+After the skill rewrites, add a note to CLAUDE.md marking tools/ as
+"legacy — do not add new code."
+      ]]></context>
+
+      <objective><![CDATA[
+1. Rewrite digest SKILL.md to use `pidgin index` (with summarize output).
+2. Rewrite embed SKILL.md to use `pidgin index`.
+3. Rewrite finalize SKILL.md to use `pidgin index` + `pidgin egg` +
+   technologic.
+4. Review new-sprint SKILL.md for Pidgin integration points. Add notes.
+5. Review run-sprint SKILL.md for Pidgin integration points. Add notes.
+6. Ensure no skill imports from tools/ for Pidgin-provided functionality.
+7. Add tools/ legacy marker to CLAUDE.md.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Rewrite: digest SKILL.md**
+
+The digest skill currently orchestrates MLD pipeline calls via tools/.
+Replace with:
+- Discovery: `pidgin index <path> --dry-run` to preview.
+- Indexing: `pidgin index <path> --batch --verbose` to run MLD.
+- Summarize: `pidgin summarize <file>` for per-file summaries.
+- Output: the skill reads results from .pidgin/nest/ via `pidgin query`.
+
+Remove any `from tools.` imports or `tools/` path references.
+
+**Rewrite: embed SKILL.md**
+
+The embed skill currently calls tools/ embedding functions directly.
+Replace with:
+- `pidgin index <path> --write-db --batch` to index and embed.
+- The nest at .pidgin/nest/ stores the embedded vectors.
+
+Remove any tools/ references.
+
+**Rewrite: finalize SKILL.md**
+
+The finalize skill currently does: inline docs + CLAUDE.md indexes +
+technologic enforcement. Replace:
+- `pidgin index <path> --batch` for inline doc generation via MLD.
+- `pidgin egg <path>` for CLAUDE.md discovery index generation.
+- Keep technologic enforcement as-is (technologic is independent of tools/).
+
+Remove any tools/ references for Pidgin-provided functionality.
+
+**Review: new-sprint SKILL.md**
+
+Read the skill. Identify where Pidgin verbs could enhance it:
+- Before writing a sprint plan, `pidgin query` could retrieve relevant
+  function context.
+- After sprint completion, `pidgin index` could re-index changed files.
+Add notes as comments in the SKILL.md marking integration points for
+future work. Do not change the skill's behavior.
+
+**Review: run-sprint SKILL.md**
+
+Same review. Identify where:
+- Pre-mission: `pidgin depends <file>` could inform the executor of
+  upstream/downstream files.
+- Post-mission: `pidgin index --sync <changed-files>` could update the
+  nest incrementally.
+Add notes as comments.
+
+**CLAUDE.md marker:**
+
+Add to the root CLAUDE.md, in the routing table or near the tools/ entry:
+
+```markdown
+> **tools/ is legacy.** Do not add new code to tools/. New functionality
+> goes in pidgin/ (CLI verbs) or .claude/skills/ (agent skills). Existing
+> tools/ code will be migrated or deprecated in v0.5.
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/digest/SKILL.md /tmp/digest-skill.m9.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/embed/SKILL.md /tmp/embed-skill.m9.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/finalize/SKILL.md /tmp/finalize-skill.m9.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md /tmp/CLAUDE.md.m9.bak`
+   FAIL: HARD
+2. Read all five SKILL.md files and the root CLAUDE.md.
+3. RUN: `grep -rn "from tools\.\|import tools\.\|tools/" /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/*/SKILL.md`
+   Note all tools/ references.
+
+**Phase 1 — Write**
+
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/digest/SKILL.md with Pidgin verb rewrites.
+   FAIL: HARD
+5. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/embed/SKILL.md with Pidgin verb rewrites.
+   FAIL: HARD
+6. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/finalize/SKILL.md with Pidgin verb rewrites.
+   FAIL: HARD
+7. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/new-sprint/SKILL.md with review notes.
+   FAIL: SOFT
+8. Edit /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/run-sprint/SKILL.md with review notes.
+   FAIL: SOFT
+9. Edit /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md to add tools/ legacy marker.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+10. RUN: `grep -rn "from tools\.\|import tools" /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/digest/SKILL.md /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/embed/SKILL.md /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/finalize/SKILL.md`
+    EXPECT: 0 matches (no tools/ imports in rewritten skills)
+    FAIL: HARD
+11. RUN: `grep -c "pidgin" /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/digest/SKILL.md /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/embed/SKILL.md /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/finalize/SKILL.md`
+    EXPECT: >= 1 match per file
+    FAIL: HARD
+12. RUN: `grep "legacy" /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md`
+    EXPECT CONTAINS: legacy
+    FAIL: HARD
+
+**Phase 3 — Report**
+
+13. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- For each rewritten skill: what changed and which Pidgin verb replaced what.
+- For reviewed skills: what integration points were identified and deferred.
+- Remaining tools/ dependencies that are NOT Pidgin-replaceable.
+- Whether tools/ legacy marker is in CLAUDE.md.
+- Step results table.
+- Anomalies.
+- Rollback: 4-file `cp /tmp/...m9.bak` sequence.
+      ]]></report>
+    </mission>
+
+    <!-- Phase 3 Gate: Agent files updated, skills rewritten, no tools/ imports. -->
+    <!-- ================================================================== -->
+    <!-- Phase 4: Documentation and Cleanup                                  -->
+    <!-- Gate: docs/pidgin.md written. CLAUDE.md and ORIGAMI.md audited.     -->
+    <!-- Project restructuring complete. Carry-forward debt cleared.         -->
+    <!-- ================================================================== -->
+
+    <mission n="10" tier="reason" review="false">
+      <context><![CDATA[
+docs/pidgin.md is the product documentation for Pidgin. The audience is
+someone encountering Pidgin for the first time, including future
+contributors. It supersedes docs/v0.md and docs/v1.md.
+
+This mission depends on Phase 3 being GREEN — the final verb surface
+and architecture must be settled before writing product docs.
+
+This is reason-tier because the author needs to understand the
+architecture to explain it coherently, not just merge existing files.
+
+Key sources:
+  - pidgin/CLAUDE.md — package overview and subpackage index
+  - pidgin/pipeline/CLAUDE.md — MLD pipeline architecture
+  - pidgin/store/CLAUDE.md — ChromaDB store architecture
+  - pidgin/verbs/CLAUDE.md — verb surface
+  - pidgin/prompts/CLAUDE.md — prompt system
+  - design.md for v0.4 — provider strategy and fine-tuning path
+      ]]></context>
+
+      <objective><![CDATA[
+1. Write docs/pidgin.md from scratch as product documentation.
+2. Cover: what Pidgin is, how MLD works, the verb surface, the nest,
+   configuration, and the provider strategy.
+3. Make it comprehensible to someone who hasn't read three sprints of
+   context.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File: /Users/elliotwillis/Desktop/fe-toolkit/docs/pidgin.md**
+
+Create this file with the following structure:
+
+# Pidgin
+
+One-paragraph introduction: what Pidgin is (LLM-native toolkit for
+codebase indexing and semantic search), who it's for (agents and
+engineers working with large codebases), what it produces (function
+descriptions, vector embeddings, discovery indexes).
+
+## How MLD Works
+
+Explain the consensus-driven compression pipeline:
+1. Generation: multiple API calls produce 3 drafts each (flock model).
+2. Embedding: all drafts are embedded to 256-dim vectors.
+3. Convergence: antipode test finds the dominant cluster. Cluster
+   size >= 8 = converged.
+4. Gate: a validation model checks the winner for correctness.
+5. Selection: Opus selects from alternatives when the gate is ambiguous.
+
+Include a diagram or ASCII art of the pipeline flow.
+
+## Verb Surface
+
+Document each verb with its flags and purpose:
+- `pidgin init [path]` — initialize .pidgin/ directory
+- `pidgin index <path>` — discover functions, run MLD, write nest
+  - `--write-db` — persist to ChromaDB
+  - `--sync` / `--batch` — force dispatch mode
+  - `--verbose` — per-function status
+  - `--dry-run` — preview without API calls
+  - `--exclude GLOB` — exclude files matching pattern
+- `pidgin query <text>` — semantic search the nest
+- `pidgin summarize <path>` — single-file MLD to stdout
+- `pidgin egg <path>` — generate CLAUDE.md discovery files
+- `pidgin depends <path>` — show import graph
+
+## The Nest
+
+Explain .pidgin/nest/: ChromaDB persistent store at the git root.
+Three collections: function_bodies, function_descriptions, descriptions.
+Queryable via `pidgin query`. Updated incrementally.
+
+## Configuration
+
+- OPENAI_API_KEY (required for index/query/summarize)
+- .env file discovery (walks up from cwd)
+- .pidgin/ directory structure
+
+## Provider Strategy
+
+Why OpenAI: fine-tunable nano model, cheaper embedding, batch API.
+What gets fine-tuned (gpt-4.1-nano on converged MLD winners).
+Gate model (per M5's recommendation).
+
+## Installation
+
+`pip install -e .` from the pidgin package root.
+
+**Style:** Clear, direct prose. No jargon without definition. No
+references to sprint numbers or mission IDs. This is product
+documentation, not a sprint consolidation doc.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Context Gathering**
+
+1. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/CLAUDE.md, /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/CLAUDE.md,
+   /Users/elliotwillis/Desktop/fe-toolkit/pidgin/store/CLAUDE.md, /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/CLAUDE.md,
+   /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/CLAUDE.md.
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/cli.py for the current verb surface and flags.
+3. Read M5's log entry for the gate model recommendation.
+
+**Phase 1 — Write**
+
+4. Write /Users/elliotwillis/Desktop/fe-toolkit/docs/pidgin.md with all sections from the spec.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+5. RUN: `wc -l /Users/elliotwillis/Desktop/fe-toolkit/docs/pidgin.md`
+   EXPECT: >= 100 lines (substantive document)
+   FAIL: SOFT
+6. RUN: `grep -c "pidgin index\|pidgin query\|pidgin egg\|pidgin depends\|pidgin summarize" /Users/elliotwillis/Desktop/fe-toolkit/docs/pidgin.md`
+   EXPECT: >= 5 (all verbs mentioned)
+   FAIL: HARD
+
+**Phase 3 — Report**
+
+7. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Document structure (section list).
+- Any architectural questions that arose during writing (carry-forwards).
+- Whether docs/v0.md and docs/v1.md should be deleted or archived.
+- Step results table.
+      ]]></report>
+    </mission>
+
+    <mission n="11" tier="reason" review="true">
+      <context><![CDATA[
+ORIGAMI.md is the design philosophy document. It is parsed by
+pidgin/prompts/templates.py:load_principle_registry() to extract
+principles for injection into MLD prompts. Any edit to ORIGAMI.md
+that breaks the parser's regex patterns will silently remove principles
+from the MLD pipeline.
+
+This mission audits ORIGAMI.md using the cleanup-prompt skill. The
+constraint is that the principle extraction output must be identical
+before and after.
+
+This is reason-tier because every edit must be evaluated for downstream
+parser impact. The review context receives before/after extraction
+output and the diff.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Git commit before any changes (safety net for revert).
+2. Run templates.py principle extraction before changes, capture output.
+3. Apply audit: add XML tags at structural boundaries, tighten language,
+   prune redundancy.
+4. Run principle extraction after changes, compare output.
+5. If any principle is lost or altered, revert that change.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Step 1: Safety commit**
+
+```bash
+git add ORIGAMI.md && git commit -m "M11 pre-audit: ORIGAMI.md baseline"
+```
+
+**Step 2: Before extraction**
+
+```python
+from pidgin.prompts.templates import load_principle_registry
+before = load_principle_registry("/Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md")
+for pid in sorted(before):
+    p = before[pid]
+    print(f"P{pid}: {p.title} | {p.mld}")
+```
+
+Capture this output. This is the ground truth.
+
+**Step 3: Audit**
+
+Read ORIGAMI.md. Apply the cleanup-prompt skill's principles:
+- Add XML-style structural markers (not literal XML — use markdown
+  horizontal rules or header hierarchy to delineate sections).
+- Tighten language: remove redundant qualifiers, passive voice,
+  hedging ("it is important to note that" → cut).
+- Prune redundancy: if two paragraphs say the same thing, keep the
+  more precise one.
+- Do NOT change the summary table format (it's the parser's input).
+- Do NOT change principle titles or MLD descriptions in the table.
+- Do NOT remove or reorder the "## Principles in Detail" section
+  headers (the parser uses "### N. Title" to extract full bodies).
+
+**Step 4: After extraction**
+
+Run the same extraction script. Compare per-principle: same title,
+same MLD text. If any differ, revert ORIGAMI.md to the safety commit
+and re-apply only the changes that don't break extraction.
+
+**Review criteria:**
+The reviewer receives: (1) before extraction output, (2) after
+extraction output, (3) the diff of ORIGAMI.md. PASS if extraction
+is identical. CONCERNS if extraction is identical but content changes
+are debatable. FAIL if any principle was lost or altered.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md /tmp/ORIGAMI.md.m11.bak`
+   FAIL: HARD
+2. RUN: `cd /project && git add ORIGAMI.md && git commit -m "M11 pre-audit: ORIGAMI.md baseline" --allow-empty`
+   FAIL: SOFT
+3. RUN: `python -c "
+from pidgin.prompts.templates import load_principle_registry
+before = load_principle_registry('/Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md')
+for pid in sorted(before):
+    p = before[pid]
+    print(f'P{pid}: {p.title} | {p.mld}')
+"`
+   Capture output as BEFORE.
+   FAIL: HARD
+
+**Phase 1 — Audit**
+
+4. Read /Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md.
+5. Edit /Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md with cleanup-prompt principles. Do NOT
+   change the summary table or "### N. Title" headers.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+6. RUN: `python -c "
+from pidgin.prompts.templates import load_principle_registry
+after = load_principle_registry('/Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md')
+for pid in sorted(after):
+    p = after[pid]
+    print(f'P{pid}: {p.title} | {p.mld}')
+"`
+   Capture output as AFTER. Compare to BEFORE.
+   EXPECT: identical principle titles and MLDs.
+   FAIL: HARD (if any principle lost or altered, revert and re-apply)
+
+**Phase 3 — Report**
+
+7. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Before/after principle extraction output (verbatim).
+- What was changed in ORIGAMI.md.
+- What was reverted due to parser breakage (if any).
+- Review verdict from the separate review context.
+- Rollback: `cp /tmp/ORIGAMI.md.m11.bak /Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md`.
+      ]]></report>
+    </mission>
+
+    <mission n="12" tier="execute" review="false">
+      <context><![CDATA[
+CLAUDE.md at the project root is 150+ lines with stale references from
+three sprint cycles. M9 may have added a tools/ legacy marker. M5's
+gate model decision should be reflected. The cleanup-prompt skill
+provides the audit methodology.
+
+This mission depends on M9 (skills rewrite may add the tools/ legacy
+marker that M12 should preserve).
+      ]]></context>
+
+      <objective><![CDATA[
+1. Audit CLAUDE.md using the cleanup-prompt skill.
+2. Prune to <= 150 lines.
+3. Add XML tags at structural boundaries.
+4. Remove references to deleted or moved items.
+5. Ensure the tools/ legacy marker from M9 is present.
+6. Update any model references to reflect M5's decision.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File: /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md**
+
+Read the current file. Identify:
+- Stale references (files that no longer exist, paths that moved).
+- Redundant sections (information duplicated across sections).
+- Missing information (tools/ legacy marker from M9, M5 model decision).
+
+Apply:
+- Remove stale references. For each removal, verify the target path
+  does not exist before removing.
+- Consolidate redundant sections.
+- Add structural comments or markdown headers to delineate sections.
+- Ensure tools/ legacy note is present and accurate.
+- Update any gate model references to the M5 winner.
+- Target: <= 150 lines.
+
+**Do NOT:**
+- Remove the routing table (it's the navigation entry point).
+- Remove vocabulary definitions.
+- Change the document structure beyond trimming and cleanup.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md /tmp/CLAUDE.md.m12.bak`
+   FAIL: HARD
+2. RUN: `wc -l /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md`
+   Note the line count as BEFORE.
+3. Read /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md.
+
+**Phase 1 — Write**
+
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md with all specified changes.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+5. RUN: `wc -l /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md`
+   EXPECT: <= 150 lines
+   FAIL: SOFT
+6. RUN: `grep "legacy" /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md`
+   EXPECT CONTAINS: legacy
+   FAIL: HARD
+
+**Phase 3 — Report**
+
+7. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Line count before and after.
+- What was removed.
+- What was updated.
+- Whether tools/ legacy note is present.
+- Rollback: `cp /tmp/CLAUDE.md.m12.bak /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md`.
+      ]]></report>
+    </mission>
+
+    <mission n="13" tier="execute" review="false">
+      <context><![CDATA[
+Three project restructuring moves that are each "move thing, update
+references, verify." Batched into one mission.
+
+1. Move tools/.venv → .venv at project root.
+2. Move templates/sprint-package/ → .claude/skills/new-sprint/templates/.
+3. Delete pidgin.egg-info/ if present.
+
+These have no interdependency with other missions.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Move tools/.venv to .venv at project root. Update references.
+2. Move templates/sprint-package/ to .claude/skills/new-sprint/templates/.
+   Update references. Delete templates/ if empty after move.
+3. Delete pidgin.egg-info/ if present.
+4. Verify pip install -e . works from the new venv.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Move 1: tools/.venv → .venv**
+
+```bash
+mv tools/.venv .venv
+```
+
+Update references in:
+- .gitignore (if it references tools/.venv)
+- pyproject.toml (if it references tools/.venv)
+- Any skill SKILL.md files that reference tools/.venv
+- Any init.sh or setup scripts
+
+After moving, verify:
+```bash
+source .venv/bin/activate && pip install -e . && python -m pidgin --help
+```
+
+**Move 2: templates/sprint-package/ → .claude/skills/new-sprint/templates/**
+
+```bash
+mkdir -p .claude/skills/new-sprint/templates
+mv templates/sprint-package/* .claude/skills/new-sprint/templates/
+```
+
+Update references in:
+- .claude/skills/new-sprint/SKILL.md (template path)
+- .claude/skills/new-sprint/CLAUDE.md (if it references templates/)
+- Root CLAUDE.md routing table (sprint workflow entry)
+
+After moving, verify templates/ is empty:
+```bash
+rmdir templates  # fails if not empty — that's the check
+```
+
+**Move 3: Delete pidgin.egg-info/**
+
+```bash
+rm -rf pidgin.egg-info/
+```
+
+This is recreated automatically by pip install -e and is already in
+.gitignore. Safe to delete.
+
+**Verification:**
+
+After all moves:
+```bash
+source .venv/bin/activate
+pip install -e .
+python -m pidgin --help
+```
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `ls -la /Users/elliotwillis/Desktop/fe-toolkit/tools/.venv /Users/elliotwillis/Desktop/fe-toolkit/templates/sprint-package/ /Users/elliotwillis/Desktop/fe-toolkit/pidgin.egg-info/ 2>/dev/null`
+   Note which items exist.
+   FAIL: SOFT (some may not exist)
+
+**Phase 1 — Move**
+
+2. RUN: `mv /Users/elliotwillis/Desktop/fe-toolkit/tools/.venv /Users/elliotwillis/Desktop/fe-toolkit/.venv` (if tools/.venv exists)
+   FAIL: SOFT (may already be at root)
+3. RUN: `mkdir -p /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/new-sprint/templates && mv /Users/elliotwillis/Desktop/fe-toolkit/templates/sprint-package/* /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/new-sprint/templates/` (if templates/sprint-package/ exists)
+   FAIL: SOFT
+4. RUN: `rmdir /Users/elliotwillis/Desktop/fe-toolkit/templates/sprint-package /Users/elliotwillis/Desktop/fe-toolkit/templates 2>/dev/null`
+   FAIL: SOFT
+5. RUN: `rm -rf /Users/elliotwillis/Desktop/fe-toolkit/pidgin.egg-info/`
+   FAIL: SOFT
+
+**Phase 2 — Update References**
+
+6. RUN: `grep -rn "tools/.venv\|tools/\.venv" /Users/elliotwillis/Desktop/fe-toolkit/.gitignore /Users/elliotwillis/Desktop/fe-toolkit/pyproject.toml /Users/elliotwillis/Desktop/fe-toolkit/.claude/ 2>/dev/null`
+   Update any matches to reference .venv at root.
+   FAIL: SOFT
+7. RUN: `grep -rn "templates/sprint-package" /Users/elliotwillis/Desktop/fe-toolkit/.claude/skills/new-sprint/ /Users/elliotwillis/Desktop/fe-toolkit/CLAUDE.md 2>/dev/null`
+   Update any matches to reference the new location.
+   FAIL: SOFT
+
+**Phase 3 — Verify**
+
+8. RUN: `ls /Users/elliotwillis/Desktop/fe-toolkit/.venv/bin/activate`
+   EXPECT EXIT CODE: 0
+   FAIL: SOFT
+9. RUN: `source /Users/elliotwillis/Desktop/fe-toolkit/.venv/bin/activate && pip install -e /project && python -m pidgin --help`
+   EXPECT EXIT CODE: 0
+   FAIL: HARD
+10. RUN: `test ! -d /Users/elliotwillis/Desktop/fe-toolkit/templates && echo PASS_NO_TEMPLATES`
+    EXPECT CONTAINS: PASS_NO_TEMPLATES
+    FAIL: SOFT
+
+**Phase 4 — Report**
+
+11. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- What was moved.
+- What references were updated (file:line for each).
+- Verification results (pip install, pidgin --help).
+- Anomalies.
+      ]]></report>
+    </mission>
+
+    <mission n="14" tier="execute" review="false">
+      <context><![CDATA[
+Batch of accumulated fixes from v0.3 carry-forward and observed issues.
+Most are one-liners. This mission depends on M4 (the module field fix
+is in the parser).
+
+Five items:
+1. Identity key uses absolute file path → change to relative.
+2. function_dict_hash diverges from function_source_hash → unify.
+3. candidates.py:86 + templates.py:96 hardcoded /Users/elliotwillis/ paths.
+4. mld.py:15 stale DEPENDS comment.
+5. P1 probe description admits surface forms (3/6 match) → tighten.
+
+Key code locations:
+  - pidgin/store/nest.py: function_id() at line ~379 uses absolute
+    file path. diff_against_nest() at line ~1139 builds identity keys.
+    upsert_function_descriptions() at line ~849 sets metadata.
+  - pidgin/utils/parser.py: function_dict_hash() at line ~783 uses
+    rstrip normalisation. function_source_hash() at line ~771 uses
+    ast.unparse.
+  - pidgin/pipeline/candidates.py:86 — audit_path hardcoded.
+  - pidgin/prompts/templates.py:96 — ORIGAMI.md path hardcoded.
+  - pidgin/pipeline/mld.py:15 — stale DEPENDS comment.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Change identity key from absolute to relative path.
+2. Unify hash functions to use source_hash for idempotency checks.
+3. Replace hardcoded /Users/elliotwillis/ paths with dynamic resolution.
+4. Remove stale DEPENDS comment.
+5. Tighten P1 probe wording so it rejects surface-level descriptions.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Item 1: Identity key — absolute → relative path**
+
+In pidgin/store/nest.py:
+- function_id() at line ~379: change to accept a relative file path.
+  The caller (upsert_function_descriptions) must pass a path relative
+  to repo_root instead of an absolute path.
+- diff_against_nest() at line ~1139: _identity_key already uses
+  whatever string the caller provides. The caller (index.py line ~211)
+  currently passes fn.get("file", "") which is absolute. Change
+  index.py to compute and pass the relative path.
+- upsert_function_descriptions() at line ~849: the function_id call
+  uses str(repo_root) + result.name. Change to use a relative path.
+
+Impact: existing nests will report all functions as "new" on next index.
+Accepted per PD3 — M6 re-indexes the primary target anyway.
+
+**Item 2: Unify hash → source_hash**
+
+In pidgin/verbs/index.py at line ~209:
+```python
+fn["source_hash"] = function_dict_hash(fn)
+```
+
+The issue: function_dict_hash uses rstrip normalisation while
+function_source_hash uses ast.unparse. Whitespace-only changes trigger
+re-MLD with dict_hash but not with source_hash. Unify to source_hash:
+
+Change index.py to compute source_hash via ast.unparse when possible.
+Add a helper that parses the function's source and calls
+function_source_hash on the AST node. Fall back to function_dict_hash
+when AST parsing fails (e.g., for non-Python files in future).
+
+**Item 3: Hardcoded paths**
+
+pidgin/pipeline/candidates.py line ~86:
+```python
+audit_path: str = "/Users/elliotwillis/Desktop/fe-toolkit/.pidgin/audit/convergence.jsonl",
+```
+Replace with dynamic resolution:
+```python
+audit_path: str = "",  # default: <git_root>/.pidgin/audit/convergence.jsonl
+```
+In the function body, resolve dynamically:
+```python
+if not audit_path:
+    from pidgin.utils.git import find_project_root
+    root = find_project_root(os.getcwd()) or os.getcwd()
+    audit_path = os.path.join(root, ".pidgin", "audit", "convergence.jsonl")
+```
+
+pidgin/prompts/templates.py line ~96:
+```python
+PRINCIPLES: dict[int, Principle] = load_principle_registry(
+    origami_path="/Users/elliotwillis/Desktop/fe-toolkit/ORIGAMI.md"
+)
+```
+Replace with dynamic resolution:
+```python
+def _default_origami_path() -> str:
+    from pidgin.utils.git import find_project_root
+    root = find_project_root(os.path.dirname(__file__)) or os.getcwd()
+    return os.path.join(root, "ORIGAMI.md")
+
+PRINCIPLES: dict[int, Principle] = load_principle_registry(
+    origami_path=_default_origami_path()
+)
+```
+
+**Item 4: Stale DEPENDS comment**
+
+pidgin/pipeline/mld.py line ~15:
+```python
+# DEPENDS: tools.utils.api, pidgin.pipeline.batch, numpy, asyncio
+```
+Change to:
+```python
+# DEPENDS: pidgin.utils.api, pidgin.pipeline.batch, numpy, asyncio
+```
+
+**Item 5: P1 probe wording**
+
+The P1 probe tests whether the gate rejects surface-level descriptions
+(descriptions that name the function's interface but not its behavior).
+Currently 3/6 match. The probe wording needs to be more specific about
+what "surface form" means.
+
+Read the existing P1 probe in pidgin/prompts/gate.xml or wherever it
+is defined. Tighten the wording so the gate model understands: a
+surface-level description merely restates the function signature or
+names (e.g., "Process the input data") without specifying WHAT the
+function does to the data. Run the probe before and after to verify
+improvement to >= 5/6.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/store/nest.py /tmp/nest.py.m14.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py /tmp/index.py.m14.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/candidates.py /tmp/candidates.py.m14.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/templates.py /tmp/templates.py.m14.bak && cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/mld.py /tmp/mld.py.m14.bak`
+   FAIL: HARD
+2. RUN: `grep -n "/Users/elliotwillis" /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/candidates.py /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/templates.py`
+   Note line numbers.
+3. Read the affected sections of each file.
+
+**Phase 1 — Write**
+
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/store/nest.py — change function_id and
+   upsert_function_descriptions to use relative paths.
+   FAIL: HARD
+5. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py — pass relative paths to the
+   identity key and unify hash to source_hash.
+   FAIL: HARD
+6. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/candidates.py — replace hardcoded
+   audit_path with dynamic resolution.
+   FAIL: HARD
+7. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/templates.py — replace hardcoded
+   ORIGAMI.md path with dynamic resolution.
+   FAIL: HARD
+8. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/mld.py — fix stale DEPENDS comment.
+   FAIL: HARD
+9. Tighten P1 probe wording (locate and edit the probe definition).
+   FAIL: SOFT
+
+**Phase 2 — Verify**
+
+10. RUN: `python -c "import ast; [ast.parse(open(f).read()) for f in ['/Users/elliotwillis/Desktop/fe-toolkit/pidgin/store/nest.py', '/Users/elliotwillis/Desktop/fe-toolkit/pidgin/verbs/index.py', '/Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/candidates.py', '/Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/templates.py', '/Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/mld.py']]"`
+    EXPECT EXIT CODE: 0
+    FAIL: HARD
+11. RUN: `grep -rn "/Users/elliotwillis" /Users/elliotwillis/Desktop/fe-toolkit/pidgin/`
+    EXPECT: 0 matches
+    FAIL: HARD
+12. RUN: `grep "tools.utils.api" /Users/elliotwillis/Desktop/fe-toolkit/pidgin/pipeline/mld.py`
+    EXPECT: 0 matches
+    FAIL: HARD
+
+**Phase 3 — Report**
+
+13. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- For each item: what changed and verification result.
+- Item 1: idempotency impact — existing nests will see all as "new".
+- Item 2: hash unification approach (AST-based vs dict-based fallback).
+- Item 5: P1 probe before/after results (how many of 6 now match).
+- Step results table.
+- Rollback: 5-file `cp /tmp/...m14.bak` sequence.
+      ]]></report>
+    </mission>
+
+    <mission n="15" tier="execute" review="false">
+      <context><![CDATA[
+**This mission drops first if the sprint runs long (PD5).**
+
+Architecture.md audit using the cleanup-prompt skill. Not a rewrite —
+just bring it current with the post-v0.4 state. Add XML tags at
+structural boundaries. Prune stale content.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Audit Architecture.md.
+2. Add XML tags at structural boundaries.
+3. Prune stale content (references to pre-v0.4 state).
+4. Do not rewrite — just trim and update.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File: /Users/elliotwillis/Desktop/fe-toolkit/ARCHITECTURE.md**
+
+Read the file. Identify stale content:
+- References to tools/ as the active code path (now legacy per M9).
+- References to the Anthropic API for gate calls (now OpenAI per M5).
+- References to tools/.venv (now .venv at root per M13).
+- References to templates/sprint-package/ (now in
+  .claude/skills/new-sprint/templates/ per M13).
+
+For each stale reference:
+- If the section is still relevant, update it.
+- If the section is entirely obsolete, remove it.
+- Add markdown horizontal rules or header hierarchy to delineate
+  major sections.
+
+Do NOT restructure the document or add new sections beyond what's
+needed to reflect v0.4 changes.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/ARCHITECTURE.md /tmp/ARCHITECTURE.md.m15.bak`
+   FAIL: HARD
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/ARCHITECTURE.md.
+
+**Phase 1 — Write**
+
+3. Edit /Users/elliotwillis/Desktop/fe-toolkit/ARCHITECTURE.md with updates and pruning.
+   FAIL: HARD
+
+**Phase 2 — Verify**
+
+4. RUN: `grep -c "tools/.venv\|templates/sprint-package" /Users/elliotwillis/Desktop/fe-toolkit/ARCHITECTURE.md`
+   EXPECT: 0 matches
+   FAIL: SOFT
+
+**Phase 3 — Report**
+
+5. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- What was removed.
+- What was updated.
+- Rollback: `cp /tmp/ARCHITECTURE.md.m15.bak /Users/elliotwillis/Desktop/fe-toolkit/ARCHITECTURE.md`.
+      ]]></report>
+    </mission>
+
+    <!-- Phase 4 Gate: docs/pidgin.md written. CLAUDE.md and ORIGAMI.md audited. -->
+    <!-- Project restructuring complete. Carry-forward debt cleared or deferred. -->
+    <!-- ================================================================== -->
+    <!-- Phase 5: Experimental (Conditional)                                 -->
+    <!-- Gate: Phase 5 dispatches only if M6 produced 500+ converged         -->
+    <!-- examples. If M6 fell short, Phase 5 is deferred to v0.5.           -->
+    <!-- M16 must complete before M17 dispatches. M18 is independent.        -->
+    <!-- ================================================================== -->
+
+    <mission n="16" tier="execute" review="false">
+      <context><![CDATA[
+Validate the structure and quality of training-data.jsonl produced by M6.
+This mission depends on M6 — it reads the training data file that M6
+generated. Do not design the fine-tuning pipeline; this mission validates
+the data, not the training process.
+
+The SFT record schema (from pidgin/store/sft.py):
+  - version: int (1)
+  - type: "sft" | "gate"
+  - timestamp: ISO-8601 UTC
+  - prompt: str (the MLD prompt assembled for this function)
+  - completion: str (the MLD winner description, for type="sft")
+  - label: "positive" | "negative" (for type="sft") or "valid" | "invalid" (for type="gate")
+  - reason: str (for type="gate")
+  - function_id: str (provenance)
+  - centroid_distance: float | None (for sft-negative)
+      ]]></context>
+
+      <objective><![CDATA[
+1. Validate JSONL is well-formed.
+2. Verify each line has the expected fields.
+3. Check for no truncated entries, no duplicate function keys.
+4. Report total example count, distribution, token statistics.
+5. Go/no-go recommendation for M17.
+      ]]></objective>
+
+      <specification><![CDATA[
+**File to validate:** <openai-python>/.pidgin/training-data.jsonl
+(or wherever M6's report says it was written).
+
+**Validation checks:**
+
+1. **Well-formed JSONL:** Every line parses as valid JSON. Report count
+   of unparseable lines (should be 0).
+
+2. **Schema conformance:** Every parsed record has fields: version, type,
+   timestamp, prompt, label, function_id. Type-specific: "sft" records
+   have completion; "gate" records have reason.
+
+3. **No truncated entries:** Check that no record has an empty prompt or
+   (for sft) empty completion. Check that no prompt or completion ends
+   mid-word or mid-sentence (heuristic: ends with alphanumeric character
+   followed by nothing, or ends with a comma).
+
+4. **No duplicate function_id + label pairs:** For sft records, each
+   (function_id, label) pair should be unique (one positive and one
+   negative per function).
+
+5. **Token counts:** For each sft-positive record, count tokens
+   (approximate: split on whitespace). Report: min, max, mean, median.
+   Check that all are within OpenAI SFT limits (~4096 tokens for
+   prompt + completion combined).
+
+6. **Distribution:** Count by type (sft vs gate), by label within each
+   type.
+
+**Output:** Print a structured report. End with a go/no-go recommendation:
+- GO if: 500+ sft-positive records, 0 schema violations, 0 duplicates,
+  all within token limits.
+- NO-GO if: < 500 records, or > 5% schema violations.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Locate Data**
+
+1. Read M6's log entry to find the exact path to training-data.jsonl.
+2. RUN: `wc -l <path-to-training-data.jsonl>`
+   EXPECT: >= 500 lines
+   FAIL: SOFT (if < 500, Phase 5 may reduce to M16 + M18 only)
+
+**Phase 1 — Validate**
+
+3. Write and run a validation script that performs all 6 checks from
+   the specification. Print results to stdout.
+   FAIL: HARD
+
+**Phase 2 — Report**
+
+4. Produce the structured report with go/no-go recommendation.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Total examples.
+- Structural validation results (well-formed, schema conformance).
+- Distribution: sft-positive, sft-negative, gate-valid, gate-invalid.
+- Token distribution: min, max, mean, median.
+- Duplicate check results.
+- Go/no-go recommendation for M17.
+      ]]></report>
+    </mission>
+
+    <mission n="17" tier="reason" review="true">
+      <context><![CDATA[
+**Conditional: Only dispatches if M16 reports 500+ valid examples and
+recommends GO.**
+
+Fine-tune gpt-4.1-nano on converged MLD winners from training-data.jsonl.
+Use OpenAI's SFT API with default hyperparameters. This is an exploratory
+run, not a production deployment.
+
+After training, run convergence probes against the fine-tuned model and
+compare against the base nano + converge.xml preamble baseline.
+
+The key question: does the fine-tuned model produce MLD-quality
+descriptions without the 7.5K token preamble?
+
+The review context receives the probe comparison data and training config.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Fine-tune gpt-4.1-nano on sft-positive records from training-data.jsonl.
+2. Run convergence probes against the fine-tuned model.
+3. Compare against the base nano + converge.xml preamble baseline.
+4. Document convergence rates and cluster metrics.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Step 1: Prepare training data**
+
+From training-data.jsonl, extract sft-positive records. Transform each
+into the OpenAI SFT format:
+
+```json
+{"messages": [
+  {"role": "system", "content": "<converge.xml preamble>"},
+  {"role": "user", "content": "<function body payload>"},
+  {"role": "assistant", "content": "{\"draft_1\":\"<winner>\",\"draft_2\":\"<winner>\",\"draft_3\":\"<winner>\"}"}
+]}
+```
+
+The assistant content uses the winner description for all three drafts
+(the fine-tuned model should learn to consistently produce high-quality
+descriptions, not to produce three different ones).
+
+Write the training file to .pidgin/sft-training.jsonl.
+
+**Step 2: Upload and fine-tune**
+
+```python
+import openai
+client = openai.OpenAI()
+file = client.files.create(
+    file=open(".pidgin/sft-training.jsonl", "rb"),
+    purpose="fine-tune",
+)
+job = client.fine_tuning.jobs.create(
+    training_file=file.id,
+    model="gpt-4.1-nano",
+    # Default hyperparameters — exploratory run
+)
+```
+
+Poll for completion. Record: job ID, training time, cost, final metrics.
+
+**Step 3: Run convergence probes**
+
+Use the same probe functions from v0.2 M3 (or define 5 representative
+functions from the OpenAI SDK). For each probe function:
+  a. Run through the fine-tuned model WITHOUT the converge.xml preamble
+     (just the function body as user message).
+  b. Run through the base gpt-4.1-nano WITH the converge.xml preamble.
+  c. For each: generate 5 calls × 3 drafts = 15 candidates. Embed all.
+     Run antipode_test. Report cluster_size and convergence.
+
+**Step 4: Compare**
+
+| Probe | Base nano + preamble cluster | Fine-tuned no-preamble cluster |
+|-------|------------------------------|-------------------------------|
+| ...   | ...                          | ...                           |
+
+Recommend: ship (fine-tuned matches or exceeds baseline) / iterate
+(fine-tuned shows promise but needs adjustment) / abandon (fine-tuned
+is worse than baseline).
+
+**Review criteria:** The reviewer assesses whether the probe methodology
+is sound and the recommendation is justified by the data.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Setup**
+
+1. Read M16's report to confirm go recommendation and example count.
+2. Read the training-data.jsonl path from M6's report.
+3. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/converge.xml for the preamble.
+
+**Phase 1 — Prepare and Train**
+
+4. Write the SFT training data preparation script. Execute it to produce
+   .pidgin/sft-training.jsonl.
+   FAIL: HARD
+5. Upload the training file and create the fine-tuning job via the
+   OpenAI API.
+   FAIL: HARD
+6. Poll for job completion. Record metrics.
+   FAIL: HARD (if the job fails, document the error)
+
+**Phase 2 — Probe**
+
+7. Define 5 probe functions (from the OpenAI SDK or test fixtures).
+8. Run convergence probes on both the fine-tuned model (no preamble) and
+   the base model (with preamble). Record results.
+   FAIL: SOFT (probe failures are informative, not blocking)
+
+**Phase 3 — Report**
+
+9. Produce the structured report with comparison table and recommendation.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Training configuration: example count, epochs, cost, training time.
+- Fine-tuned model ID.
+- Probe results table: base vs fine-tuned, per-probe cluster_size
+  and convergence.
+- Recommendation: ship / iterate / abandon.
+- If iterate: what to change (more data, different hyperparameters,
+  different training format).
+      ]]></report>
+    </mission>
+
+    <mission n="18" tier="reason" review="false">
+      <context><![CDATA[
+Audit converge.xml using the cleanup-prompt skill findings from v0.3.
+Three targeted changes. This mission is independent of M16/M17.
+
+Key code location: pidgin/prompts/converge.xml. The file contains:
+- 33 positive examples
+- 17 anti-examples (negative examples that may anchor the model on
+  failure patterns — the "pink-elephant effect")
+- Rules, concision tiers, vocabulary, and the output schema
+
+Convergence probes from v0.2 M3 are the regression test: run before
+and after each change.
+      ]]></context>
+
+      <objective><![CDATA[
+1. Remove the 17 anti-examples. Run probes before/after. If convergence
+   rate drops, revert.
+2. Replace hand-crafted examples with real converged winners from M6's
+   run data. Run probes to verify no regression.
+3. Fix the contradictory Role section framing.
+      ]]></objective>
+
+      <specification><![CDATA[
+**Change 1: Remove anti-examples**
+
+In converge.xml, the <examples> section contains both positive
+<example> elements and negative <anti_example> elements. The 17
+anti-examples may anchor the model on failure patterns (pink-elephant
+effect: telling the model what NOT to do makes it more likely to do it).
+
+Step 1a: Run convergence probes (P1-P4 from v0.2 M3) with the current
+converge.xml. Record cluster_size and convergence for each probe.
+
+Step 1b: Remove all <anti_example> elements from converge.xml.
+
+Step 1c: Re-run convergence probes. Compare to baseline.
+  - If convergence rate drops (any probe that was converged becomes
+    non-converged): revert the anti-example removal.
+  - If convergence rate stays the same or improves: keep the removal.
+
+**Change 2: Replace hand-crafted examples with real winners**
+
+From M6's training-data.jsonl, select the 15-20 best converged winners:
+- Only sft-positive records.
+- Prefer functions with high cluster_size (from the nest metadata).
+- Prefer diversity: different function types, different modules,
+  different description lengths.
+
+Replace the current 33 hand-crafted positive examples with these
+real winners. Keep the same XML structure:
+
+```xml
+<example language="python" target_n="12">
+  <function_body>...</function_body>
+  <good_description>...</good_description>
+</example>
+```
+
+Run convergence probes after replacement. If any regression, revert
+and keep the original examples.
+
+**Change 3: Fix contradictory Role section**
+
+The <role> section says both "increasing refinement" (implies
+iterative improvement across drafts) and "each one sentence" (implies
+independent drafts). These are contradictory.
+
+Pick "each one sentence" — drafts are independent parallel attempts,
+not iterative refinements. Remove the "increasing refinement" language.
+
+**Test:** Convergence probes before and after each change. M3 probes
+(P1-P4) from v0.2 are the regression suite.
+      ]]></specification>
+
+      <steps><![CDATA[
+**Phase 0 — Baseline**
+
+1. RUN: `cp /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/converge.xml /tmp/converge.xml.m18.bak`
+   FAIL: HARD
+2. Read /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/converge.xml. Count examples and
+   anti-examples.
+3. Run convergence probes (P1-P4). Record baseline results.
+   FAIL: HARD
+
+**Phase 1 — Change 1: Remove anti-examples**
+
+4. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/converge.xml. Remove all <anti_example>
+   elements.
+   FAIL: HARD
+5. Run convergence probes. Compare to baseline.
+   If regression: revert. If stable: keep.
+   FAIL: SOFT
+
+**Phase 2 — Change 2: Replace examples with real winners**
+
+6. Read M6's training-data.jsonl. Select 15-20 best winners.
+7. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/converge.xml. Replace hand-crafted
+   examples with real winners.
+   FAIL: HARD
+8. Run convergence probes. Compare.
+   If regression: revert to post-Change-1 state.
+   FAIL: SOFT
+
+**Phase 3 — Change 3: Fix Role section**
+
+9. Edit /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/converge.xml. Remove "increasing
+   refinement" language, keep "each one sentence."
+   FAIL: SOFT
+
+**Phase 4 — Final verification**
+
+10. Run convergence probes on final state. Record results.
+    FAIL: HARD
+
+**Phase 5 — Report**
+
+11. Produce the structured report.
+      ]]></steps>
+
+      <report><![CDATA[
+- Status: GREEN/RED.
+- Before/after probe results for each change:
+  | Probe | Baseline cluster | After Change 1 | After Change 2 | Final |
+- Which examples were replaced (old → new, brief description of each).
+- Whether anti-examples were kept or removed.
+- The Role section fix.
+- Final converge.xml diff summary.
+- Rollback: `cp /tmp/converge.xml.m18.bak /Users/elliotwillis/Desktop/fe-toolkit/pidgin/prompts/converge.xml`.
+      ]]></report>
+    </mission>
+
+  </missions>
+</sprint>

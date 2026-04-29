@@ -1,0 +1,17 @@
+{
+  "probe_id": "P2_main",
+  "target_n": 12,
+  "description": "Parse CLI args, read text, embed it, write JSON vector.",
+  "natural_length": 10,
+  "converged": true,
+  "candidates_generated": 15,
+  "candidates_filtered": 0,
+  "survivors": 15,
+  "gate_verdict": "ambiguous",
+  "gate_reason": "primary invalid: The candidate description omits critical details such as resolving the API key, handling input from file or stdin, error handling for missing or empty input, and printing additional information to stderr. It also truncates the description, missing the final output message and return value.; retry invalid: The candidate description does not mention parsing CLI arguments, resolving input and API key, or writing additional information to stderr, which are part of the function's behavior.",
+  "selection_rationale": "primary invalid: The candidate description omits critical details such as resolving the API key, handling input from file or stdin, error handling for missing or empty input, and printing additional information to stderr. It also truncates the description, missing the final output message and return value.; retry invalid: The candidate description does not mention parsing CLI arguments, resolving input and API key, or writing additional information to stderr, which are part of the function's behavior.; selection call failed: BadRequestError(\"Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': '`temperature` is deprecated for this model.'}, 'request_id': 'req_011CaUTPyGMs1ha6E6veaems'}\")",
+  "degenerate_pre_check": false,
+  "deduped": false,
+  "confidence": 0.8,
+  "cost_dollars": 0.005302219999999999
+}
