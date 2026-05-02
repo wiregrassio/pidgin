@@ -50,7 +50,7 @@ BATCH_FILE_SIZE_CEILING = 200 * 1024 * 1024  # 200MB OpenAI ceiling, defensive c
 # clusters without forcing extra batches on borderline-tight ones.
 
 ADAPTIVE_CONVERGENCE_THRESHOLD = 0.99
-ADAPTIVE_MAX_BATCHES = 5
+ADAPTIVE_MAX_BATCHES = 10
 ADAPTIVE_INITIAL_BATCHES = 2  # always run at least 2 to compute a delta
 
 
@@ -111,6 +111,7 @@ class GenerationRequest:
     model: str
     max_tokens: int = 500
     response_format: dict | None = None
+    temperature: float = 0.3
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,7 @@ def build_jsonl(requests: list[GenerationRequest]) -> str:
                 {"role": "user", "content": req.payload},
             ],
             "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
         }
         if req.response_format is not None:
             body["response_format"] = req.response_format
@@ -175,18 +177,19 @@ def should_use_batch(n_tasks: int, dispatch: Literal["auto", "sync", "batch"]) -
 # ---------------------------------------------------------------------------
 
 def _extract_drafts(content: str) -> list[str]:
-    """Extract drafts from a completion content string using four-shape fallback.
+    """Extract description(s) from a completion content string using four-shape fallback.
 
-    Shape 1: JSON object {"draft_1":..,"draft_2":..,"draft_3":..}
-    Shape 2: JSON object {"drafts":[..]}
-    Shape 3: JSON array [...]
-    Shape 4: Bare string split on \\n\\n
+    Shape 1: JSON object {"description": str}  — primary shape (single description)
+    Shape 2: JSON object {"draft_1":..,"draft_2":..,"draft_3":..}  — legacy three-draft
+    Shape 3: JSON object {"drafts":[..]}
+    Shape 4: JSON array [...]
+    Shape 5: Bare string split on \\n\\n
     """
     text = content.strip() if content else ""
     if not text:
         return []
 
-    # Attempt JSON parse for shapes 1, 2, 3.
+    # Attempt JSON parse for shapes 1, 2, 3, 4.
     parsed = None
     try:
         parsed = json.loads(text)
@@ -194,7 +197,13 @@ def _extract_drafts(content: str) -> list[str]:
         pass
 
     if isinstance(parsed, dict):
-        # Shape 1: {"draft_1":..,"draft_2":..,"draft_3":..}
+        # Shape 1: {"description": str}
+        if "description" in parsed and isinstance(parsed["description"], str):
+            desc = parsed["description"].strip()
+            if desc:
+                return [desc]
+
+        # Shape 2: {"draft_1":..,"draft_2":..,"draft_3":..}
         if "draft_1" in parsed:
             drafts = []
             for key in ("draft_1", "draft_2", "draft_3"):
@@ -204,15 +213,15 @@ def _extract_drafts(content: str) -> list[str]:
             if drafts:
                 return drafts
 
-        # Shape 2: {"drafts":[..]}
+        # Shape 3: {"drafts":[..]}
         if "drafts" in parsed and isinstance(parsed["drafts"], list):
             return [str(d) for d in parsed["drafts"] if d is not None]
 
-    # Shape 3: bare JSON array
+    # Shape 4: bare JSON array
     if isinstance(parsed, list):
         return [str(d) for d in parsed if d is not None]
 
-    # Shape 4: bare string split on \n\n
+    # Shape 5: bare string split on \n\n
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     return parts if parts else [text]
 
@@ -568,6 +577,7 @@ def run_batch_generation(
                 {"role": "user", "content": req.payload},
             ],
             "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
         }
         if req.response_format is not None:
             body["response_format"] = req.response_format
@@ -826,24 +836,17 @@ def run_batch_embedding(
 @dataclass(frozen=True)
 class FunctionMldResult:
     name: str
-    candidates: list[str]                   # up to ADAPTIVE_MAX_BATCHES * 3 candidate descriptions
+    candidates: list[str]                   # up to ADAPTIVE_MAX_BATCHES candidate descriptions
     vectors: "list[list[float] | None]"     # parallel to candidates
     cluster_size: int
-    converged: bool                          # True when convergence_verdict == "CONVERGED"
+    converged: bool                          # True when spherical_variance(vectors) < CONVERGENCE_THRESHOLD
+    sv: float = 0.0                          # spherical variance of all valid vectors
     first_error: "str | None" = None        # set when all gen results for this function errored
-    per_draft_centroid: "dict[int, list[float]]" = field(default_factory=dict)
-    per_draft_tightness: "dict[int, float]" = field(default_factory=dict)
-    per_draft_n: "dict[int, int]" = field(default_factory=dict)
     # M14 — adaptive convergence-stop instrumentation.
     n_batches_run: int = 0
     final_convergence_delta: "float | None" = None
     # M18 — SFT provenance: the MLD prompt assembled for this function.
     prompt_used: str = ""
-    # Convergence verdict fields (convergence_verdict() in geometry.py).
-    convergence_verdict: str = "AMBIGUOUS"   # "CONVERGED" | "DIVERGENT" | "AMBIGUOUS"
-    sv1: "float | None" = None               # spherical variance for draft_1 tier
-    sv2: "float | None" = None               # spherical variance for draft_2 tier
-    sv3: "float | None" = None               # spherical variance for draft_3 tier
 
 
 # ---------------------------------------------------------------------------
@@ -932,11 +935,9 @@ def _build_converge_request(
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "draft_1": {"type": "string"},
-                        "draft_2": {"type": "string"},
-                        "draft_3": {"type": "string"},
+                        "description": {"type": "string"},
                     },
-                    "required": ["draft_1", "draft_2", "draft_3"],
+                    "required": ["description"],
                     "additionalProperties": False,
                 },
                 "strict": True,
@@ -964,6 +965,7 @@ def _generate_one_sync(req: GenerationRequest) -> GenerationResult:
             prompt=req.cached_preamble,
             content=req.payload,
             model=req.model,
+            temperature=0.3,
             max_tokens=req.max_tokens,
             schema=schema,
         )
@@ -974,8 +976,14 @@ def _generate_one_sync(req: GenerationRequest) -> GenerationResult:
             r = r[0] if r else None
         structured = getattr(r, "structured", None) if r else None
         if structured and isinstance(structured, dict):
-            drafts = [structured.get(k, "") for k in ("draft_1", "draft_2", "draft_3")]
-            drafts = [d for d in drafts if d]
+            # Primary shape: {"description": str}
+            if "description" in structured and isinstance(structured["description"], str):
+                desc = structured["description"].strip()
+                drafts = [desc] if desc else []
+            else:
+                # Legacy fallback: {"draft_1":..,"draft_2":..,"draft_3":..}
+                drafts = [structured.get(k, "") for k in ("draft_1", "draft_2", "draft_3")]
+                drafts = [d for d in drafts if d]
         else:
             drafts = []
     except Exception:
@@ -1125,13 +1133,14 @@ def _run_pipeline_sync_adaptive(
     """
     import sys
 
-    from pidgin.pipeline.geometry import convergence_verdict as _convergence_verdict, cosine_similarity, centroid as _centroid
+    ensure_api_key("OPENAI_API_KEY")
+
+    from pidgin.pipeline.geometry import is_converged as _is_converged, cosine_similarity, centroid as _centroid
 
     output: list[FunctionMldResult] = []
 
     for fi, fn in enumerate(functions):
         cands: list[str] = []
-        draft_idxs: list[int] = []
         vectors: list["list[float] | None"] = []
         valid_vecs: list[list[float]] = []
         prev_centroid: "list[float] | None" = None
@@ -1149,17 +1158,14 @@ def _run_pipeline_sync_adaptive(
             gen_errors.append(gr.error)
 
             new_texts: list[str] = []
-            new_slots: list[int] = []
             if not gr.error and gr.drafts:
-                for slot, draft in enumerate(gr.drafts[:3], start=1):
+                for draft in gr.drafts[:1]:
                     if draft:
                         new_texts.append(draft)
-                        new_slots.append(slot)
 
             new_vecs = _embed_sync(new_texts) if new_texts else []
-            for text, slot, vec in zip(new_texts, new_slots, new_vecs):
+            for text, vec in zip(new_texts, new_vecs):
                 cands.append(text)
-                draft_idxs.append(slot)
                 vectors.append(vec)
                 if vec is not None:
                     valid_vecs.append(vec)
@@ -1190,48 +1196,29 @@ def _run_pipeline_sync_adaptive(
         all_errored = bool(gen_errors) and all(e for e in gen_errors)
         func_first_error = gen_errors[0] if all_errored else None
 
-        draft_cent, draft_tight, draft_n = _stratify(cands, draft_idxs, vectors)
-
-        # Convergence verdict via per-draft spherical variance (geometry.convergence_verdict).
-        _d1_vecs = [v for di, v in zip(draft_idxs, vectors) if di == 1 and v is not None]
-        _d2_vecs = [v for di, v in zip(draft_idxs, vectors) if di == 2 and v is not None]
-        _d3_vecs = [v for di, v in zip(draft_idxs, vectors) if di == 3 and v is not None]
-        _cverd, _csvs = (
-            _convergence_verdict(_d1_vecs, _d2_vecs, _d3_vecs)
-            if _d1_vecs and _d2_vecs and _d3_vecs
-            else ("AMBIGUOUS", {"sv1": None, "sv2": None, "sv3": None})
-        )
+        # Convergence via single-number spherical variance test.
+        _converged, _sv = _is_converged(valid_vecs) if valid_vecs else (False, 0.0)
 
         output.append(FunctionMldResult(
             name=fn.get("name", ""),
             candidates=cands,
             vectors=vectors,
             cluster_size=cluster_size,
-            converged=_cverd == "CONVERGED",
+            converged=_converged,
+            sv=_sv,
             first_error=func_first_error,
-            per_draft_centroid=draft_cent,
-            per_draft_tightness=draft_tight,
-            per_draft_n=draft_n,
             n_batches_run=n_batches,
             final_convergence_delta=final_delta,
             prompt_used=func_prompt,  # M18 — SFT provenance
-            convergence_verdict=_cverd,
-            sv1=_csvs.get("sv1"),
-            sv2=_csvs.get("sv2"),
-            sv3=_csvs.get("sv3"),
         ))
 
         if verbose:
-            parts = ", ".join(
-                f"d{di}:{draft_tight[di]:.3f} (n={draft_n[di]})"
-                for di in sorted(draft_tight)
-            )
             stop_note = (
                 f" stop@{n_batches} delta={final_delta:.4f}"
                 if final_delta is not None
                 else f" stop@{n_batches} delta=n/a"
             )
-            print(f"[mld] {fn.get('name', '')}: {parts}{stop_note}", file=sys.stderr)
+            print(f"[mld] {fn.get('name', '')}: sv={_sv:.4f} converged={_converged}{stop_note}", file=sys.stderr)
 
         # M1: fire on_chunk_complete after each function (chunk size = 1).
         if on_chunk_complete is not None:
@@ -1479,6 +1466,7 @@ def _submit_one_chunk_generation(
                 {"role": "user", "content": req.payload},
             ],
             "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
         }
         if req.response_format is not None:
             body["response_format"] = req.response_format
@@ -1561,17 +1549,16 @@ def _build_function_mld_results_from_gen(
     """
     import sys
 
-    from pidgin.pipeline.geometry import convergence_verdict as _convergence_verdict, cosine_similarity, centroid as _centroid
+    from pidgin.pipeline.geometry import is_converged as _is_converged, cosine_similarity, centroid as _centroid
 
     n_chunk_funcs = len(chunk_functions)
-    cap = max_batches * 3
+    cap = max_batches
 
     # Build gen_by_id for lookup.
     gen_by_id: dict[str, GenerationResult] = {r.custom_id: r for r in gen_results_for_chunk}
 
-    # Flatten drafts → candidates per function in this chunk.
+    # Flatten candidates per function in this chunk (1 draft per call).
     func_candidates: list[list[str]] = [[] for _ in range(n_chunk_funcs)]
-    func_draft_indices: list[list[int]] = [[] for _ in range(n_chunk_funcs)]
     func_cand_call: list[list[int]] = [[] for _ in range(n_chunk_funcs)]
 
     for local_fi in range(n_chunk_funcs):
@@ -1579,13 +1566,11 @@ def _build_function_mld_results_from_gen(
         for ci in range(max_batches):
             gr = gen_by_id.get(f"gen:func={fi}:call={ci}")
             if gr and not gr.error and gr.drafts:
-                for draft_slot, draft in enumerate(gr.drafts[:3], start=1):
-                    if draft:
-                        func_candidates[local_fi].append(draft)
-                        func_draft_indices[local_fi].append(draft_slot)
-                        func_cand_call[local_fi].append(ci)
+                draft = gr.drafts[0] if gr.drafts else None
+                if draft:
+                    func_candidates[local_fi].append(draft)
+                    func_cand_call[local_fi].append(ci)
         func_candidates[local_fi] = func_candidates[local_fi][:cap]
-        func_draft_indices[local_fi] = func_draft_indices[local_fi][:cap]
         func_cand_call[local_fi] = func_cand_call[local_fi][:cap]
 
     # Build EmbeddingRequests for all candidates in this chunk.
@@ -1662,40 +1647,20 @@ def _build_function_mld_results_from_gen(
         all_errored = bool(func_gen_results) and all(gr.error for gr in func_gen_results)
         func_first_error = func_gen_results[0].error if all_errored else None
 
-        draft_idxs_local = func_draft_indices[local_fi]
-        draft_cent, draft_tight, draft_n = _stratify(
-            cands,
-            draft_idxs_local,
-            vectors,
-        )
-
-        # Convergence verdict via per-draft spherical variance (geometry.convergence_verdict).
-        _d1_vecs = [v for di, v in zip(draft_idxs_local, vectors) if di == 1 and v is not None]
-        _d2_vecs = [v for di, v in zip(draft_idxs_local, vectors) if di == 2 and v is not None]
-        _d3_vecs = [v for di, v in zip(draft_idxs_local, vectors) if di == 3 and v is not None]
-        _cverd, _csvs = (
-            _convergence_verdict(_d1_vecs, _d2_vecs, _d3_vecs)
-            if _d1_vecs and _d2_vecs and _d3_vecs
-            else ("AMBIGUOUS", {"sv1": None, "sv2": None, "sv3": None})
-        )
+        # Convergence via single-number spherical variance test.
+        _converged, _sv = _is_converged(valid_vecs) if valid_vecs else (False, 0.0)
 
         output.append(FunctionMldResult(
             name=fn.get("name", ""),
             candidates=cands,
             vectors=vectors,
             cluster_size=cluster_size,
-            converged=_cverd == "CONVERGED",
+            converged=_converged,
+            sv=_sv,
             first_error=func_first_error,
-            per_draft_centroid=draft_cent,
-            per_draft_tightness=draft_tight,
-            per_draft_n=draft_n,
             n_batches_run=max_batches,
             final_convergence_delta=final_delta,
             prompt_used=func_prompt_used[func_base_fi + local_fi],
-            convergence_verdict=_cverd,
-            sv1=_csvs.get("sv1"),
-            sv2=_csvs.get("sv2"),
-            sv3=_csvs.get("sv3"),
         ))
 
     return output

@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <pidgin_prompt verb="converge" doc_type="function_description" version="1">
   <role>
-    You are the MLD convergence generator. Produce three drafts at
-    increasing refinement that describe the function in the payload
-    using the minimum tokens to remain lossless.
+    You are the MLD convergence generator. Produce one concise description
+    that describes the function in the payload using the minimum tokens to
+    remain lossless.
 
     You are a precision describer. You produce minimum-lossless descriptions
-    of code and prose. Your job: given a code snippet, return THREE drafts —
-    each one sentence that describes what it DOES. No prose. No hedging.
-    No commentary. The three drafts are the whole output.
+    of code and prose. Your job: given a code snippet, return ONE description —
+    a single sentence that describes what it DOES. No prose. No hedging.
+    No commentary. The description is the whole output.
   </role>
 
   <principles>
@@ -25,7 +25,7 @@
     <rule id="5">No passive voice. Reject forms like "is parsed by", "was computed by", "been processed". The function DOES; it is not done TO.</rule>
     <rule id="6">No copula leads. Reject: "is", "was", "are", "were", "be", "been", "being", "has", "have", "had" as the first word.</rule>
     <rule id="7">No truncation. If the sentence ends with a trailing comma, colon, semicolon, or conjunction (and, or, but, with, for, to) at end-of-string, the sentence is malformed. If the last word is a fragment or partial token (e.g., "trunc", "dimens", "config,"), the sentence is malformed. Write a sentence that FINISHES at the budget boundary, not one that runs off the end. Descriptions must be complete sentences.</rule>
-    <rule id="8">Structured output. The caller enforces a JSON schema via API-level response_format or strict tool use. You do NOT format JSON yourself. Return the three drafts as the schema specifies.</rule>
+    <rule id="8">Structured output. The caller enforces a JSON schema via API-level response_format or strict tool use. You do NOT format JSON yourself. Return the description as the schema specifies.</rule>
   </rules>
 
   <concision_tiers>
@@ -332,14 +332,15 @@ def run_sprint(plan):
 
     <example type="positive" id="ex20" target_n="32" language="Python">
       <input>
-def run_mld_pipeline(func_text, budgets=[8,16,24,32], n=4):
+def run_mld_pipeline(func_text, budgets=[8,16,24,32], n=10):
     candidates_by_budget = {b: [generate(func_text, b) for _ in range(n)] for b in budgets}
     filtered = {b: [c for c in cs if grammar_filter(c)] for b, cs in candidates_by_budget.items()}
-    centroid = {b: embedding_centroid(filtered[b]) for b in budgets}
-    return convergence_verdict(centroid)
+    vecs = {b: [embed(c) for c in filtered[b]] for b in budgets}
+    converged, sv = is_converged([v for vs in vecs.values() for v in vs])
+    return converged, sv
       </input>
-      <output>Spawn parallel MLD candidate generation at each budget tier, grammar-filter rejects, embed survivors, compute convergence verdict from per-draft spherical variance.</output>
-      <why>All key pipeline stages named. Origami vocabulary (MLD, grammar-filter, convergence_verdict). Imperative verb. Under target.</why>
+      <output>Spawn parallel MLD candidate generation at each budget tier, grammar-filter rejects, embed survivors, and return convergence status from single-number spherical variance test.</output>
+      <why>All key pipeline stages named. Origami vocabulary (MLD, grammar-filter, is_converged). Imperative verb. Under target.</why>
     </example>
 
     <example type="positive" id="ex21" target_n="32" language="Go">
@@ -539,8 +540,6 @@ func (m *Marionette) ExecuteMission(block string, tier string) (Report, error) {
   </payload>
 
   <output_schema>
-    <field name="draft_1" type="string" min_tokens="1" max_tokens="120"/>
-    <field name="draft_2" type="string" min_tokens="1" max_tokens="80"/>
-    <field name="draft_3" type="string" min_tokens="1" max_tokens="60"/>
+    <field name="description" type="string" required="true" additionalProperties="false"/>
   </output_schema>
 </pidgin_prompt>

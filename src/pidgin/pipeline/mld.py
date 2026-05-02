@@ -5,12 +5,12 @@
 # unchanged — sync and batch paths produce identical downstream shape.
 
 # MODULE: mld
-# DOES: V2 minimum lossless description — soft budgets, three-draft generation,
+# DOES: V2 minimum lossless description — soft budgets, single-draft generation,
 #       LLM gate, Opus selection. Dispatch parameter routes to sync or batch path.
 # EMITS: MLDResult (description, target_n, natural_length, confidence, gate_verdict,
 #        selection_rationale, cost)
 # READS: input text, prompt, target_n, n_calls, model selections, dispatch mode
-# IMPLEMENTS: parallel three-draft generation → mechanical pre-filter →
+# IMPLEMENTS: parallel single-draft generation → mechanical pre-filter →
 #             degeneracy checks → spherical variance convergence → gate → selection
 # DEPENDS: tools.utils.api, pidgin.pipeline.batch, numpy, asyncio
 
@@ -59,14 +59,12 @@ class MLDResult:
 # Schemas
 # ---------------------------------------------------------------------------
 
-_THREE_DRAFT_SCHEMA = {
+_DESCRIPTION_SCHEMA = {
     "type": "object",
     "properties": {
-        "draft_1": {"type": "string"},
-        "draft_2": {"type": "string"},
-        "draft_3": {"type": "string"},
+        "description": {"type": "string"},
     },
-    "required": ["draft_1", "draft_2", "draft_3"],
+    "required": ["description"],
     "additionalProperties": False,
 }
 
@@ -169,10 +167,10 @@ def _pre_filter(candidates: list[str]) -> tuple[list[str], list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Generation helper — single call returning three drafts
+# Generation helper — single call returning one description
 # ---------------------------------------------------------------------------
 
-async def _three_draft_call(
+async def _single_draft_call(
     prompt: str,
     content: str,
     model: str,
@@ -187,7 +185,7 @@ async def _three_draft_call(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
-            schema=_THREE_DRAFT_SCHEMA,
+            schema=_DESCRIPTION_SCHEMA,
             n=1,
         )
     except Exception:
@@ -204,8 +202,8 @@ def _drafts_from_calls(
 ) -> tuple[list[tuple[str, str, int]], int]:
     """Flatten call results into [(text, tier, call_idx), ...] and a failure count.
 
-    Each successful call contributes three triples (d1, d2, d3). Failed calls
-    contribute zero triples and increment the failure count.
+    Each successful call contributes one triple. Failed calls contribute zero
+    triples and increment the failure count.
     """
     triples: list[tuple[str, str, int]] = []
     failures = 0
@@ -213,13 +211,11 @@ def _drafts_from_calls(
         if not isinstance(result, dict):
             failures += 1
             continue
-        for tier_label in ("d1", "d2", "d3"):
-            key = "draft_" + tier_label[1]
-            value = result.get(key)
-            if isinstance(value, str):
-                triples.append((value, tier_label, call_idx))
-            else:
-                failures += 1
+        value = result.get("description")
+        if isinstance(value, str):
+            triples.append((value, "d1", call_idx))
+        else:
+            failures += 1
     return triples, failures
 
 
@@ -380,7 +376,6 @@ def _make_generation_requests(
     """Build GenerationRequest objects for a batch run.
 
     custom_id format: "embed_for_store:call=N:draft=N/A"
-    N/A for draft because three-draft mode is packed into one call.
     """
     requests = []
     for i in range(n_calls):
@@ -390,11 +385,12 @@ def _make_generation_requests(
             payload=user_content,
             model=model,
             max_tokens=max_tokens,
+            temperature=0.3,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
                     "name": "answer",
-                    "schema": _THREE_DRAFT_SCHEMA,
+                    "schema": _DESCRIPTION_SCHEMA,
                     "strict": True,
                 },
             },
@@ -409,8 +405,8 @@ def _batch_results_to_call_results(
     """Convert GenerationResult list from batch into the call_results format.
 
     Each GenerationResult.drafts is already parsed from the four-shape fallback.
-    Reconstruct a dict in the expected {"draft_1":..,"draft_2":..,"draft_3":..}
-    shape for downstream _drafts_from_calls compatibility.
+    Reconstruct a dict in the expected {"description": str} shape for downstream
+    _drafts_from_calls compatibility.
     """
     call_results: list[dict | None] = []
     for result in batch_results:
@@ -418,10 +414,7 @@ def _batch_results_to_call_results(
             call_results.append(None)
             continue
         drafts = result.drafts
-        out = {}
-        for idx, key in enumerate(("draft_1", "draft_2", "draft_3")):
-            out[key] = drafts[idx] if idx < len(drafts) else ""
-        call_results.append(out)
+        call_results.append({"description": drafts[0] if drafts else ""})
     return call_results
 
 
@@ -436,7 +429,7 @@ async def mld(
     prompt_text: str | None = None,
     gate_prompt_text: str | None = None,
     n_calls: int = 5,
-    temperature: float = 0.8,
+    temperature: float = 0.3,
     generation_model: str = "gpt-4.1-nano",
     gate_model: str = "gpt-4.1-nano",
     selection_model: str = "claude-opus-4-7",
@@ -491,7 +484,7 @@ async def mld(
     else:
         # Sync path: async parallel generation (original v0.1 behaviour).
         first_pass = await asyncio.gather(*[
-            _three_draft_call(
+            _single_draft_call(
                 prompt=effective_prompt,
                 content=user_content,
                 model=generation_model,
@@ -531,7 +524,7 @@ async def mld(
             # Re-roll once — always use sync path for re-roll.
             deduped = True
             second_pass = await asyncio.gather(*[
-                _three_draft_call(
+                _single_draft_call(
                     prompt=effective_prompt,
                     content=user_content,
                     model=generation_model,
@@ -607,24 +600,18 @@ async def mld(
             alt_indices = []
 
     # -----------------------------------------------------------------------
-    # Phase 6 — Convergence verdict via per-draft spherical variance
+    # Phase 6 — Convergence via single-number spherical variance test
     # -----------------------------------------------------------------------
-    if not degenerate_pre_check and cloud.shape[0] >= 3:
-        from pidgin.pipeline.geometry import convergence_verdict as _convergence_verdict
-        _d1_vecs = [cloud[i].tolist() for i, t in enumerate(passing_triples) if t[1] == "d1"]
-        _d2_vecs = [cloud[i].tolist() for i, t in enumerate(passing_triples) if t[1] == "d2"]
-        _d3_vecs = [cloud[i].tolist() for i, t in enumerate(passing_triples) if t[1] == "d3"]
-        if _d1_vecs and _d2_vecs and _d3_vecs:
-            _cverd, _ = _convergence_verdict(_d1_vecs, _d2_vecs, _d3_vecs)
-            converged = _cverd == "CONVERGED"
-        else:
-            converged = False
+    if not degenerate_pre_check and cloud.shape[0] >= 2:
+        from pidgin.pipeline.geometry import is_converged as _is_converged
+        _all_vecs = cloud.tolist()
+        converged, _ = _is_converged(_all_vecs)
         # Pick centroid-nearest for gate and alternatives.
         _centroid_vec = cloud.mean(axis=0)
         _distances = np.linalg.norm(cloud - _centroid_vec, axis=1)
         nearest_idx = int(_distances.argmin())
         alt_indices = _pick_alternatives(cloud, passing_triples, nearest_idx, target_n)
-    elif not degenerate_pre_check and cloud.shape[0] < 3:
+    elif not degenerate_pre_check and cloud.shape[0] < 2:
         # Sparse cloud: cannot run a meaningful antipode test. Pick the
         # centroid-nearest (or the lone candidate) and proceed to gate.
         if cloud.shape[0] >= 1:

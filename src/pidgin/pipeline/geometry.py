@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # MODULE: geometry
 # DOES: Provide cosine similarity, centroid, spherical variance, and
-#       draft-decay convergence verdict helpers for the MLD pipeline.
-# EMITS: cosine_similarity, centroid, spherical_variance, convergence_verdict
+#       single-number convergence test helpers for the MLD pipeline.
+# EMITS: cosine_similarity, centroid, spherical_variance, is_converged
 # READS: nothing
 # IMPLEMENTS: geometry math for 256-dim embedding space
 # DEPENDS: numpy
 # PROVENANCE: tools/mld/pipeline.py _cosine_sim_matrix
 
 import numpy as np
+
+CONVERGENCE_THRESHOLD = 0.10
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -38,30 +40,10 @@ def spherical_variance(vectors: list[list[float]]) -> float:
     return float(1.0 - np.linalg.norm(mean_vec))
 
 
-def convergence_verdict(
-    draft_1_vecs: list[list[float]],
-    draft_2_vecs: list[list[float]],
-    draft_3_vecs: list[list[float]],
-) -> tuple[str, dict[str, float]]:
-    """Return (verdict, sv_dict) from per-draft spherical variances.
-
-    Computes spherical variance for each draft tier and compares the
-    sequence sv1 → sv2 → sv3. Strictly decreasing = CONVERGED (variance
-    shrinks as drafts refine). Strictly increasing = DIVERGENT. Anything
-    else = AMBIGUOUS. No threshold — the relationship between the three
-    values is the test.
-
-    Returns:
-      verdict: "CONVERGED" | "DIVERGENT" | "AMBIGUOUS"
-      sv_dict: {"sv1": float, "sv2": float, "sv3": float}
-    """
-    sv1 = spherical_variance(draft_1_vecs)
-    sv2 = spherical_variance(draft_2_vecs)
-    sv3 = spherical_variance(draft_3_vecs)
-    svs = {"sv1": sv1, "sv2": sv2, "sv3": sv3}
-    if sv1 > sv2 > sv3:
-        return "CONVERGED", svs
-    elif sv3 > sv2 > sv1:
-        return "DIVERGENT", svs
-    else:
-        return "AMBIGUOUS", svs
+def is_converged(
+    vectors: list[list[float]],
+    threshold: float = CONVERGENCE_THRESHOLD,
+) -> tuple[bool, float]:
+    """Single-number convergence test. Returns (converged, sv)."""
+    sv = spherical_variance(vectors)
+    return sv < threshold, sv

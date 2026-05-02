@@ -518,11 +518,8 @@ def run(args) -> int:
                     if r.first_error is not None:
                         print(f"  ✗ {r.name} (error: {r.first_error})", file=sys.stderr)
                     elif r.converged:
-                        tight_vals = list(r.per_draft_tightness.values())
-                        tightness = sum(tight_vals) / len(tight_vals) if tight_vals else 0.0
                         print(
-                            f"  ✓ {r.name} (converged, cluster={r.cluster_size}, "
-                            f"tightness={tightness:.2f})",
+                            f"  ✓ {r.name} (converged, sv={r.sv:.4f}, cluster={r.cluster_size})",
                             file=sys.stderr,
                         )
                     else:

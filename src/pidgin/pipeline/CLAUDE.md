@@ -39,7 +39,7 @@ convergence pipeline. Extracted from tools/utils/mld.py v0.1.
 | `cosine_similarity` | fn | Compute cosine similarity between two float vectors; returns float in [-1, 1]. |
 | `centroid` | fn | Compute the element-wise mean of a list of float vectors. |
 | `spherical_variance` | fn | Return 1 - ||mean(unit_vectors)||; 0 = perfect consensus, 1 = scatter. |
-| `convergence_verdict` | fn | Return ("CONVERGED"\|"DIVERGENT"\|"AMBIGUOUS", sv_dict) by comparing spherical variance across draft_1, draft_2, draft_3 tier groups. |
+| `is_converged` | fn | Return (converged, sv) where converged = spherical_variance(vectors) < threshold. |
 
 ### candidates.py
 Adaptive candidate generation with expansion policy — generate an initial batch,
@@ -92,14 +92,13 @@ should_use_batch(n_tasks, "batch") → True  (always batch)
 3. `[...]` — bare vector list
 4. `{"vector":[...]}` — dict with vector key
 
-## convergence_verdict Draft-Decay Test
+## is_converged Convergence Test
 
-Computes `spherical_variance` (1 - ||mean(unit_vectors)||) independently for
-each of the three draft tiers (draft_1, draft_2, draft_3). Strictly decreasing
-sv1 > sv2 > sv3 = CONVERGED. Strictly increasing = DIVERGENT. Non-monotone =
-AMBIGUOUS. No threshold — the monotone relationship between the three values
-is the test. Both batch and sync paths use this function; `FunctionMldResult`
-stores the verdict string plus sv1/sv2/sv3 floats.
+Computes `spherical_variance` (1 - ||mean(unit_vectors)||) across all candidate
+vectors. Returns `(converged, sv)` where `converged = sv < CONVERGENCE_THRESHOLD`
+(0.10). Single-number test calibrated against 12,600 API calls: sv < 0.10 gives
+81% convergence at N=10 calls, temperature=0.3. Both batch and sync paths use
+this function; `FunctionMldResult` stores `sv` and `converged`.
 
 ## Anthropic Batch Surface (M9)
 
