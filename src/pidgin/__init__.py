@@ -1,54 +1,28 @@
-# MIT License
-# Copyright (c) 2026 Elliot Willis
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+"""pidgin — code access layer for LLM agents.
 
-# MODULE: pidgin
-# DOES: Write-model package for artifact_write (Modes 3/4) and future update
-#       semantics. Supersedes the per-operation git bracket in tools/store/audit.py.
-# VERSION: 0.2.0
+This package owns the OpenAI routing layer plus the nine verbs:
+index, search, graph, egg, get, put, assert (internal), score, rank.
 
-__version__ = "0.2.0"
+Sprint 1a shipped the read path: index, search, graph, egg, get.
+Sprint 1b adds the write path: put, edit (context manager), flush.
+"""
 
-# ---------------------------------------------------------------------------
-# Re-exports — public API (M10 adds store + pipeline + prompts re-exports)
-# ---------------------------------------------------------------------------
+__version__ = "0.6.0a1"
 
-# pidgin.write — Modes 2, 3, 4
-# Note: `update` is the function (factory returning Transaction), not the module.
-# Naming collision resolved: `from pidgin.write import update` imports the function.
-from pidgin.write import artifact_write, compress_write, ArtifactWriteResult
-from pidgin.write import update
+# Read-path entry points (Sprint 1a).
+from pidgin.get import get, GetResult                          # noqa: F401
+from pidgin.search import search, SearchResult                  # noqa: F401
+from pidgin.graph import ImportGraph                            # noqa: F401
+from pidgin.egg import egg                                      # noqa: F401
+from pidgin.index import index_file, index_directory, IndexResult, collect_repo_files  # noqa: F401
+from pidgin.nest import Nest                                    # noqa: F401
 
-# pidgin.prompts
-from pidgin.prompts import assemble_xml_prompt
+# Write-path entry points (Sprint 1b).
+from pidgin.edit import edit, EditContext, EditContextBusyError, ChangeRecord  # noqa: F401
+from pidgin.put import put_symbol, PutResult, FidelityError, PrudenceWarning   # noqa: F401
+from pidgin.flush import flush, FlushReport, FlushError                        # noqa: F401
 
-# pidgin.pipeline
-from pidgin.pipeline import run_embedding_mld_pipeline_for_functions
-
-# pidgin.store — re-exported as module references (callers use nest.section_put_chroma etc.)
-from pidgin.store import nest, audit
-
-__all__ = [
-    # write
-    "artifact_write",
-    "compress_write",
-    "ArtifactWriteResult",
-    "update",
-    # prompts
-    "assemble_xml_prompt",
-    # pipeline
-    "run_embedding_mld_pipeline_for_functions",
-    # store (module refs)
-    "nest",
-    "audit",
-]
+# Eval verbs (Sprint v0.6).
+from pidgin.assert_ import verify  # noqa: F401
+from pidgin.score import score  # noqa: F401
+from pidgin.rank import rank  # noqa: F401

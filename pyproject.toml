@@ -1,14 +1,15 @@
 [project]
 name = "pidgin"
-version = "0.2.0"
+version = "0.6.0a1"
 requires-python = ">=3.11"
 dependencies = [
-    "openai",
-    "anthropic",
-    "chromadb",
-    "numpy",
-    "python-dotenv",
+    "openai>=2.33.0",
+    "lancedb>=0.30.0",
+    "rustworkx>=0.17.0",
 ]
+
+[project.optional-dependencies]
+format = ["black"]
 
 [project.scripts]
 pidgin = "pidgin.cli:main"
@@ -16,6 +17,9 @@ pidgin = "pidgin.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["pidgin*"]
+
+[tool.setuptools.package-data]
+pidgin = ["prompts/*.xml"]
 
 [build-system]
 requires = ["setuptools>=68.0"]

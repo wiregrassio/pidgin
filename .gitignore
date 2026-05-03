@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 calibration-vectors.npz
 local/
+.DS_Store
+.claude/settings.local.json

@@ -1,63 +1,65 @@
-# pidgin/
+# pidgin
 
-Write-model package for RF-Edge sprint tooling. V0.2 extraction from tools/.
-Implements artifact write Modes 2, 3, 4; MLD pipeline; prompts; store; utils.
+Code-access library for LLM agents. Owns the OpenAI routing layer plus nine
+verbs: index, search, graph, egg, get, put, assert, score, rank. This is a
+library — orchestration and sprint infrastructure live in wiregrass.
 
-## Public API (from pidgin import ...)
-
-| Symbol | Kind | DOES |
-|--------|------|------|
-| `artifact_write` | fn | Batch write files (Mode 3) with git bracket and audit. |
-| `update` | fn | Return a Transaction context manager for atomic file edits (Mode 2). |
-| `assemble_xml_prompt` | fn | Assemble an XML prompt template with principle injection and cache-boundary split. |
-| `run_embedding_mld_pipeline_for_functions` | fn | Run the full generation + embedding MLD pipeline for a list of function dicts. |
-| `nest` | module | ChromaDB sections store + function vector store (merged sections_chroma + vectors). |
-| `audit` | module | JSONL audit helpers: file_hash, audit_log_path, audit_log. |
-
-## CLI (python -m pidgin)
-
-Wired in M11. Run `python -m pidgin --help` for full usage.
+## Package layout
 
 ```
-pidgin index <path> [--write-db] [--sync] [--batch]
-pidgin update <path> [--write-source] [--edits-file FILE]   # stub M12
-pidgin new <path> [--write-source]                          # stub M12
-pidgin query <text>                                         # stub M12
-pidgin init [path]                                          # stub M13
+src/pidgin/
+├── __init__.py       # re-exports all public names
+├── __main__.py       # python -m pidgin entry
+├── cli.py            # argparse dispatcher (nine subparsers)
+├── api.py            # OpenAI routing: generate(), embed_text(), cost tracking
+├── nest.py           # .pidgin/nest/ storage layout (LanceDB + import graph)
+├── extract.py        # AST extraction of functions, classes, methods
+├── index.py          # index a file or directory into LanceDB
+├── search.py         # semantic search over the LanceDB symbol store
+├── graph.py          # import-graph queries: blast-radius, depends, cycles
+├── egg.py            # generate CLAUDE.md from indexed symbol records
+├── get.py            # extract a named symbol from source via AST
+├── put.py            # rewrite a symbol in source, fidelity/prudence gated
+├── edit.py           # EditContext: context-manager for multi-symbol edits
+├── flush.py          # flush staged edits from an EditContext to disk
+├── resolve.py        # input resolution: files, dirs, git refs, stdin, literals
+├── skill_runner.py   # boilerplate for eval/reasoning skill scripts
+├── assert_.py        # binary verification verb (stub)
+├── score.py          # cardinal scoring verb (stub)
+├── rank.py           # ordinal ranking verb (stub)
+└── prompts/          # XML prompt templates
 ```
 
-PD2: All flags are per-subcommand (after the verb).
-PD3: `--sync` + `--batch` → exit 2, "Cannot specify both --sync and --batch."
-PD6: `index` without `--write-db` → dry-run, zero API calls.
+## Install
 
-See `pidgin/verbs/CLAUDE.md` for verb details.
+```bash
+cd /path/to/pidgin
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
 
-## Subpackages
+## CLI
 
-| Package | DOES |
-|---------|------|
-| `pidgin.write` | Modes 2 (update), 3 (artifact_write), 4 (lineage-tracked write). File writes with git bracket and JSONL audit. |
-| `pidgin.prompts` | XML prompt assembler (assemble_xml_prompt), converge.xml, gate.xml, PRINCIPLES registry. |
-| `pidgin.pipeline` | Sync and batch MLD dispatch (mld, run_embedding_mld_pipeline_for_functions, batch, geometry, candidates). |
-| `pidgin.store` | ChromaDB backend — nest.py (sections + function vectors) and audit.py (JSONL helpers). |
-| `pidgin.utils` | api.py (embedding constants + OpenAI client + embed_for_store), git.py (git helpers), parser.py (AST + regex extractors + extract_public_functions). |
-| `pidgin.verbs` | CLI verb implementations. index (wired); update, new, query, init (stubs). |
+```bash
+pidgin index <path>        # index source into LanceDB
+pidgin search <query>      # semantic search over symbols
+pidgin graph <file>        # blast-radius / depends / cycles
+pidgin egg <dir>           # write CLAUDE.md from index
+pidgin get --name <name> --file <file.py>   # extract a symbol
+pidgin put ...             # rewrite a symbol (M8)
+pidgin assert ...          # binary verification (M8)
+pidgin score ...           # cardinal scoring (M8)
+pidgin rank ...            # ordinal ranking (M8)
+```
 
 ## Version
 
 ```python
-import pidgin; pidgin.__version__  # "0.2.0"
+import pidgin; pidgin.__version__  # "0.5.0a2" (module attr; pyproject ships 0.6.0a1)
 ```
 
-## How to Navigate
+## Provider config
 
-1. Find the symbol in the table above.
-2. Read the relevant subpackage's CLAUDE.md:
-   - `pidgin/write/CLAUDE.md` — Modes 2/3/4 signatures and audit format
-   - `pidgin/prompts/CLAUDE.md` — XML prompt structure and usage
-   - `pidgin/pipeline/CLAUDE.md` — dispatch routing, batch surface, MLD phases
-   - `pidgin/store/CLAUDE.md` — ChromaDB collections and metadata schema
-   - `pidgin/verbs/CLAUDE.md` — CLI verb implementations and flag conventions
-3. Use awk to find the function's start line, then read the range.
-
-Never read an entire file. Use the index then awk then ranged read.
+- Generation: gpt-4.1-mini / gpt-4.1-nano (via api.py)
+- Embeddings: text-embedding-3-small, 256-dim
+- OPENAI_API_KEY must be set in the environment
