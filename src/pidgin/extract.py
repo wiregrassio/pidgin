@@ -5,11 +5,13 @@ Provides:
   - extract_symbols(source) -> list[Symbol]
   - extract_symbol_by_name(source, name) -> Symbol | None
   - extract_imports(source, file_path=None) -> list[str]   (module names)
-  - resolve_import_to_file(module_name, repo_root, repo_files) -> str | None
+  - scan_package_roots(repo_files) -> dict[str, str]
+  - resolve_import_to_file(module_name, repo_root, repo_files, package_roots=None) -> str | None
 """
 from __future__ import annotations
 
 import ast
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -256,6 +258,61 @@ def extract_imports(
 
 
 # --------------------------------------------------------------------------- #
+# Package root registry                                                       #
+# --------------------------------------------------------------------------- #
+
+def scan_package_roots(repo_files: set[str]) -> dict[str, str]:
+    """Discover Python package roots and return {package_name: repo_relative_prefix}.
+
+    A package root is the deepest __init__.py-bearing directory whose parent
+    directory does NOT contain __init__.py. The prefix is the repo-relative
+    path to the directory that contains the package root (ending with "/").
+
+    Entries already covered by the fixed prefixes "" and "src/" are omitted.
+    On name conflicts the shortest prefix wins; a warning is emitted to stderr.
+    """
+    init_dirs: set[str] = set()
+    for f in repo_files:
+        if f.endswith("/__init__.py"):
+            init_dirs.add(f[: -len("/__init__.py")])
+
+    registry: dict[str, str] = {}
+
+    for d in sorted(init_dirs):
+        slash = d.rfind("/")
+        parent = d[:slash] if slash != -1 else ""
+
+        if parent in init_dirs:
+            continue
+
+        package_name = d.split("/")[-1]
+        prefix = (parent + "/") if parent else ""
+
+        if prefix in ("", "src/"):
+            continue
+
+        if package_name in registry:
+            existing = registry[package_name]
+            if len(prefix) < len(existing):
+                print(
+                    f"pidgin warning: package root conflict for '{package_name}': "
+                    f"'{prefix}' replaces '{existing}'",
+                    file=sys.stderr,
+                )
+                registry[package_name] = prefix
+            else:
+                print(
+                    f"pidgin warning: package root conflict for '{package_name}': "
+                    f"keeping '{existing}', ignoring '{prefix}'",
+                    file=sys.stderr,
+                )
+        else:
+            registry[package_name] = prefix
+
+    return registry
+
+
+# --------------------------------------------------------------------------- #
 # Module-name -> repo-relative file path                                      #
 # --------------------------------------------------------------------------- #
 
@@ -263,19 +320,20 @@ def resolve_import_to_file(
     module_name: str,
     repo_root: Path,
     repo_files: set[str],
+    package_roots: dict[str, str] | None = None,
 ) -> str | None:
     """Map a Python module name to a repo-relative file path.
 
-    Resolution attempts:
-      1. 'foo.bar' -> 'foo/bar.py'              (module file)
-      2. 'foo.bar' -> 'foo/bar/__init__.py'     (package init)
-      3. Drop rightmost dotted component, retry 1-2.
-      4. Repeat until the name has no dots; then return None if nothing
-         in `repo_files` matched.
+    Resolution attempts per dotted-component iteration:
+      1. 'foo.bar' -> 'foo/bar.py'
+      2. 'foo.bar' -> 'foo/bar/__init__.py'
+      3. 'foo.bar' -> 'src/foo/bar.py'
+      4. 'foo.bar' -> 'src/foo/bar/__init__.py'
+      5. registry lookup via package_roots (monorepo layouts)
+      6. Drop rightmost dotted component, retry 1-5.
 
     Only paths that appear in `repo_files` are returned. `repo_root`
-    is accepted for symmetry with future callers but is not required
-    for the pure-string resolution implemented here.
+    is accepted for API symmetry but is not used in resolution.
     """
     _ = repo_root  # accepted for API symmetry; not used in resolution.
     if not module_name:
@@ -295,6 +353,16 @@ def resolve_import_to_file(
         as_package_src = "src/" + as_package
         if as_package_src in repo_files:
             return as_package_src
+        if package_roots:
+            top_level = parts[0]
+            if top_level in package_roots:
+                prefix = package_roots[top_level]
+                as_module_reg = prefix + "/".join(parts) + ".py"
+                if as_module_reg in repo_files:
+                    return as_module_reg
+                as_package_reg = prefix + "/".join(parts) + "/__init__.py"
+                if as_package_reg in repo_files:
+                    return as_package_reg
         parts = parts[:-1]
 
     return None

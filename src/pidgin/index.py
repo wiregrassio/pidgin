@@ -26,6 +26,7 @@ from pidgin.extract import (
     extract_imports,
     extract_symbols,
     resolve_import_to_file,
+    scan_package_roots,
 )
 from pidgin.graph import ImportGraph
 from pidgin.nest import Nest
@@ -191,6 +192,7 @@ def index_file(
     model: str = "gpt-5.4-mini",
     effort: str = "medium",
     force: bool = False,
+    package_roots: dict[str, str] | None = None,
 ) -> IndexResult:
     """Index one Python file. Sequential, single-threaded.
 
@@ -261,7 +263,7 @@ def index_file(
         imports = []
 
     resolved = [
-        resolve_import_to_file(m, nest.repo_root, repo_files)
+        resolve_import_to_file(m, nest.repo_root, repo_files, package_roots)
         for m in imports
     ]
     resolved_files = sorted({r for r in resolved if r is not None})
@@ -442,6 +444,7 @@ def index_directory(
     """
     # Step 1 — build the full repo file set (single source of truth)
     repo_files = collect_repo_files(nest.repo_root)
+    package_roots = scan_package_roots(repo_files)
 
     # Step 2 — walk directory for *.py files
     directory = directory.resolve()
@@ -468,6 +471,7 @@ def index_directory(
                 model=model,
                 effort=effort,
                 force=force,
+                package_roots=package_roots,
             )
             results.append(result)
         except Exception as e:
@@ -520,9 +524,11 @@ def main() -> int:
 
     if target.is_file():
         repo_files = collect_repo_files(nest.repo_root)
+        package_roots = scan_package_roots(repo_files)
         results = [index_file(
             target, nest, graph, repo_files,
             model=args.model, effort=args.effort, force=args.force,
+            package_roots=package_roots,
         )]
     elif target.is_dir():
         results = index_directory(
