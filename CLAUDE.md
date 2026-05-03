@@ -24,9 +24,10 @@ src/pidgin/
 ├── flush.py          # flush staged edits from an EditContext to disk
 ├── resolve.py        # input resolution: files, dirs, git refs, stdin, literals
 ├── skill_runner.py   # boilerplate for eval/reasoning skill scripts
-├── assert_.py        # binary verification verb (stub)
-├── score.py          # cardinal scoring verb (stub)
-├── rank.py           # ordinal ranking verb (stub)
+├── assert_.py        # binary verification verb
+├── _assert.py        # internal assert helper, used by assert_.py
+├── score.py          # cardinal scoring verb (1-10)
+├── rank.py           # ordinal ranking verb
 └── prompts/          # XML prompt templates
 ```
 
@@ -46,16 +47,16 @@ pidgin search <query>      # semantic search over symbols
 pidgin graph <file>        # blast-radius / depends / cycles
 pidgin egg <dir>           # write CLAUDE.md from index
 pidgin get --name <name> --file <file.py>   # extract a symbol
-pidgin put ...             # rewrite a symbol (M8)
-pidgin assert ...          # binary verification (M8)
-pidgin score ...           # cardinal scoring (M8)
-pidgin rank ...            # ordinal ranking (M8)
+pidgin put ...             # rewrite a symbol
+pidgin assert ...          # binary verification
+pidgin score ...           # cardinal scoring
+pidgin rank ...            # ordinal ranking
 ```
 
 ## Version
 
 ```python
-import pidgin; pidgin.__version__  # "0.5.0a2" (module attr; pyproject ships 0.6.0a1)
+import pidgin; pidgin.__version__  # "0.6.0a1"
 ```
 
 ## Provider config
