@@ -1,0 +1,5 @@
+$0e2d2f44-d5e9-4523-a5b1-bd33be4c08b6²±id ÿÿÿÿÿÿÿÿÿ*string8"	file_path ÿÿÿÿÿÿÿÿÿ*string8kind ÿÿÿÿÿÿÿÿÿ*string8&description ÿÿÿÿÿÿÿÿÿ*string08>description_vector ÿÿÿÿÿÿÿÿÿ*fixed_size_list:float:2568"	signature ÿÿÿÿÿÿÿÿÿ*string8<signature_vector ÿÿÿÿÿÿÿÿÿ*fixed_size_list:float:2568$source_hash ÿÿÿÿÿÿÿÿÿ*string8&last_modified ÿÿÿÿÿÿÿÿÿ*string8#
+git_author	 ÿÿÿÿÿÿÿÿÿ*string8&mutation_count
+ ÿÿÿÿÿÿÿÿÿ*int648 repo_id ÿÿÿÿÿÿÿÿÿ*string8"'
+lance.auto_cleanup.older_than14days"!
+lance.auto_cleanup.interval20
