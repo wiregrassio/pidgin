@@ -261,6 +261,9 @@ def extract_imports(
 # Package root registry                                                       #
 # --------------------------------------------------------------------------- #
 
+_LAYOUT_DIRS = {"src", "lib", "pkg"}
+
+
 def scan_package_roots(repo_files: set[str]) -> dict[str, str]:
     """Discover Python package roots and return {package_name: repo_relative_prefix}.
 
@@ -289,6 +292,9 @@ def scan_package_roots(repo_files: set[str]) -> dict[str, str]:
         prefix = (parent + "/") if parent else ""
 
         if prefix in ("", "src/"):
+            continue
+
+        if package_name in _LAYOUT_DIRS:
             continue
 
         if package_name in registry:
